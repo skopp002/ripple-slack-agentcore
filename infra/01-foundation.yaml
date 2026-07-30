@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Ripple Slack Assistant — build foundation: source bucket, ECR repository,
+  CodeBuild project + role, and the CodeBuild log group. Deploy this FIRST.
+
+  CloudFormation cannot build a container image, and AWS::BedrockAgentCore::Runtime
+  requires a ContainerUri that already exists in ECR. So the build plane lives here
+  and 02-runtime.yaml consumes the resulting image tag as a parameter.
+
+Parameters:
+  AgentName:
+    Type: String
+    Default: ripple
+    Description: Drives derived resource names (ECR repo, CodeBuild project).
+    AllowedPattern: '^[a-z][a-z0-9_-]{0,40}$'
+
+  ProjectTagValue:
+    Type: String
+    Default: ripple_slack_assistant
+    Description: >
+      Value for the project_name cost allocation tag. Applied to every taggable
+      resource here. Must be byte-identical across all stacks or Cost Explorer
+      will report them as separate projects.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Build source. A DEDICATED bucket, unlike the toolkit's account-shared
+  # bedrock-agentcore-codebuild-sources-* bucket: a bucket-level cost tag on a
+  # shared bucket would attribute other agents' storage to this project.
+  # ---------------------------------------------------------------------------
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    # Retain so an accidental stack delete cannot destroy uploaded build sources.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'ripple-agentcore-build-sources-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-build-sources
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  SourceBucketTlsOnly:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub '${SourceBucket.Arn}/*'
+            Condition:
+              Bool: {'aws:SecureTransport': false}
+
+  # ---------------------------------------------------------------------------
+  # Image registry
+  # ---------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub 'bedrock-agentcore-${AgentName}'
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — ARM64 (AgentCore Runtime requires linux/arm64)
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Ripple${AgentName}CodeBuildRole'
+      Description: Builds the Ripple agent container and pushes it to ECR.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            # Confused-deputy guard, carried over from the hand-made role.
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      Policies:
+        - PolicyName: CodeBuildExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ecr:GetAuthorizationToken'
+                Resource: '*'   # this action does not support resource scoping
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                Resource: !GetAtt EcrRepository.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub '${CodeBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: !Sub '${SourceBucket.Arn}/*'
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  # Deterministic name (/aws/codebuild/<project>), so it can be declared here and
+  # get retention + tags. The RUNTIME log group cannot: its name embeds the
+  # generated runtime id. See 02-runtime.yaml.
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/bedrock-agentcore-${AgentName}-builder'
+      RetentionInDays: 30
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'bedrock-agentcore-${AgentName}-builder'
+      Description: ARM64 container build for the Ripple AgentCore runtime.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: ARM_CONTAINER
+        Image: 'aws/codebuild/amazonlinux2-aarch64-standard:3.0'
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        PrivilegedMode: true   # required to run docker build
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Type: PLAINTEXT, Value: !GetAtt EcrRepository.RepositoryUri}
+          # Overridden per build by scripts/cfn_build.py with a timestamp tag.
+          - {Name: IMAGE_TAG, Type: PLAINTEXT, Value: latest}
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Source:
+        Type: S3
+        Location: !Sub '${SourceBucket}/${AgentName}/source.zip'
+        # Parameterised by IMAGE_TAG, unlike the toolkit's generated buildspec
+        # which bakes a literal tag in and so needs a rewrite every build.
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Authenticating to ECR..."
+                - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REPO_URI"
+            build:
+              commands:
+                - echo "Building $ECR_REPO_URI:$IMAGE_TAG"
+                - docker build -t "$ECR_REPO_URI:$IMAGE_TAG" .
+            post_build:
+              commands:
+                - docker push "$ECR_REPO_URI:$IMAGE_TAG"
+                - echo "Pushed $ECR_REPO_URI:$IMAGE_TAG"
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+Outputs:
+  SourceBucketName:
+    Value: !Ref SourceBucket
+    Export: {Name: !Sub '${AWS::StackName}-SourceBucket'}
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export: {Name: !Sub '${AWS::StackName}-EcrRepositoryUri'}
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject
+    Export: {Name: !Sub '${AWS::StackName}-CodeBuildProject'}

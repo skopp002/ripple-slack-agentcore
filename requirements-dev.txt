@@ -1,0 +1,36 @@
+# Dependencies for the OPERATOR's machine — deploying, running the CLI client, and
+# regenerating diagrams. NOT installed into the container image; that is
+# requirements.txt, which is deliberately kept to the agent's runtime needs only.
+#
+# Why a second file: `pip install -r requirements.txt` inside the image must not
+# pull matplotlib. A single merged file would ship a plotting stack into every
+# container for the sake of two local scripts.
+#
+# Install:
+#     python3 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements-dev.txt
+#
+# Python 3.12+ recommended. Verified on 3.12.13 and 3.14.6.
+
+# --- deploy: scripts/deploy.py, cfn_build.py, apply_tags.py, create_github_provider.py
+# botocore comes with boto3; ClientError is imported from it directly.
+boto3>=1.40
+
+# --- CLI client: client/login.py (Auth0 device flow), client/ask.py (invoke runtime)
+# PyJWT needs the [crypto] extra: login.py decodes the Auth0 JWT, and RS256 —
+# which is what Auth0 issues — requires the cryptography backend.
+PyJWT[crypto]==2.10.1
+requests==2.32.3
+
+# --- diagrams: infra/render_diagrams.py, infra/render_components.py
+# Renderer-only dependency. Both scripts force the Agg backend, so no display or
+# GUI toolkit is needed and nothing leaves the machine. Skip this line entirely if
+# you never regenerate the PNGs — the committed PNGs are all that deploying needs.
+matplotlib>=3.8
+
+# NOT listed, on purpose:
+#   bedrock-agentcore-starter-toolkit — slated for deprecation, removed from this
+#     repo entirely. Deploys are CloudFormation; see infra/README.md.
+#   bedrock-agentcore — the SDK. Only agent/ imports it, so it belongs in
+#     requirements.txt (the image), not here. Installing it locally is harmless
+#     but not required to deploy or to run the client.

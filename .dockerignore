@@ -1,0 +1,38 @@
+# Ripple agent build context — OWNED BY THIS REPO, not toolkit-generated.
+#
+# The Dockerfile COPYs an explicit allowlist (requirements.txt + agent/), so
+# nothing here is load-bearing for correctness. It stays as defence in depth: if
+# someone later replaces those COPYs with `COPY . .`, these rules are what stops
+# credentials and virtualenvs from entering an image that gets pushed to ECR.
+#
+# The toolkit's version listed ~30 patterns for tooling this repo does not use
+# (node_modules, tox, cdk, terraform). Removed — an ignore rule for a directory
+# that cannot exist reads as if it might.
+
+# Secrets — the only entries here that would be a real incident.
+dev.env
+client/.token.json
+
+# Virtualenvs: huge, and built for the host's architecture, not arm64.
+.venv/
+.venv-deploy/
+
+# Python bytecode — wrong-architecture .pyc files shadow the real modules.
+__pycache__/
+*.py[cod]
+
+# Everything else in the repo that is not the agent: docs, IaC, diagrams,
+# operator scripts. None belongs in the runtime image.
+docs/
+infra/
+scripts/
+client/
+tracking/
+*.md
+
+# Toolkit leftovers. Kept ignored so a stale local copy cannot ride along.
+.bedrock_agentcore.yaml
+.bedrock_agentcore/
+
+.git/
+.DS_Store

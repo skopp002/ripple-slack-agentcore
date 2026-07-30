@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Ripple Slack Assistant — the agent itself: AgentCore Memory, GitHub OAuth2
+  credential provider, runtime execution role, Runtime (Auth0 CUSTOM_JWT) and a
+  RuntimeEndpoint. Deploy AFTER 01-foundation.yaml and after an image exists.
+
+  NOTE ON TAG SHAPES: the AgentCore CFN schemas are inconsistent — Runtime,
+  RuntimeEndpoint and Memory take Tags as a MAP ({key: value}), while
+  OAuth2CredentialProvider takes a LIST ([{Key:, Value:}]). Both appear below;
+  this is schema-mandated, not an oversight.
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Default: ripple-foundation
+    Description: Stack name of 01-foundation.yaml (for cross-stack imports).
+
+  AgentName:
+    Type: String
+    Default: ripple
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+    Description: >
+      AgentCore runtime name. Underscores allowed, hyphens are NOT — the
+      AgentRuntimeName pattern is stricter than most AWS names.
+
+  ImageTag:
+    Type: String
+    Description: >
+      ECR image tag to deploy, e.g. 20260728-141233-001. Produced by
+      scripts/cfn_build.py. Must already exist in the repo.
+
+  ProjectTagValue:
+    Type: String
+    Default: ripple_slack_assistant
+
+  # ---- Auth0 ----
+  Auth0Domain:
+    Type: String
+    Description: e.g. dev-xxxx.us.auth0.com (no scheme, no trailing slash).
+  Auth0Audience:
+    Type: String
+    Description: Auth0 API identifier, used as the allowed JWT audience.
+
+  # ---- Bedrock ----
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-opus-4-8
+
+  # ---- GitHub ----
+  GithubClientId:
+    Type: String
+    Description: GitHub OAuth App client ID (not a secret).
+  GithubClientSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. ARN of a Secrets Manager secret holding the GitHub OAuth client
+      secret, used with ClientSecretSource=EXTERNAL so the secret never enters
+      this template or CloudFormation history. Leave EMPTY to instead pass
+      GithubClientSecret directly (MANAGED).
+  GithubClientSecretJsonKey:
+    Type: String
+    Default: client_secret
+    Description: JSON key within the secret holding the value.
+  GithubClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      Only used when GithubClientSecretArn is empty. Prefer the ARN route —
+      values passed here are visible to anyone with cloudformation:GetTemplate
+      style access to parameters.
+  GithubScopes:
+    Type: String
+    Default: 'repo read:org'
+
+  ConsentReturnUrl:
+    Type: String
+    Default: 'http://localhost:8799/consent'
+    Description: >
+      Where AgentCore sends the USER'S BROWSER after the vendor's code has been
+      exchanged. THIS MUST BE A URL OUR OWN CODE SERVES — it is NOT a decorative
+      landing page. AgentCore appends a ?session_id=... and the token is vaulted
+      ONLY when the application then calls CompleteResourceTokenAuth with that
+      session id (client/consent.py does this from a loopback server).
+      Point it at a third party — GitHub's "authorized applications" page renders
+      perfectly — and the session_id is silently discarded: the vendor shows the app
+      as authorized, GetResourceOauth2Token keeps returning a fresh authorization
+      URL, and the session stays IN_PROGRESS forever. Every symptom then says
+      "the user never consented" when in fact consent was given and never completed.
+      Distinct from the PROVIDER CALLBACK (GithubProvider.CallbackUrl), which
+      receives the vendor's ?code=&state= and goes in the vendor's OAuth app.
+      Setting this to that value fails with "2 validation errors detected: Value at
+      'authorizationCode' failed to satisfy constraint".
+      Must match client/consent.py CONSENT_RETURN_URL and be registered via
+      scripts/register_consent_url.py. Replace with your own route when a web front
+      end exists.
+
+  MemoryExpiryDays:
+    Type: Number
+    Default: 90
+    MinValue: 3
+    MaxValue: 365
+    Description: EventExpiryDuration is in DAYS (schema range 3-365).
+
+Conditions:
+  UseExternalSecret: !Not [!Equals [!Ref GithubClientSecretArn, '']]
+
+Mappings:
+  Endpoint:
+    Primary:
+      # Referenced in several places; only Name is createOnly on RuntimeEndpoint,
+      # so it is NOT GetAtt-able — keep the literal in one spot.
+      Name: live
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Memory — short-term, partitioned per user by actorId (the Auth0 `sub`).
+  # ---------------------------------------------------------------------------
+  # PROVISIONED BUT NOT YET READ BY THE AGENT — the stateless/stateful switch.
+  # The agent is stateless per invocation (fresh Agent, no history; see
+  # agent/agent.py invoke()). This resource exists so going stateful needs NO
+  # infrastructure change: its id is already injected as AGENTCORE_MEMORY_ID
+  # below, so only agent code changes. Kept always-on rather than behind a
+  # Condition because an empty Memory resource costs nothing at rest, whereas
+  # adding one later to a live stack is a deploy the team has to schedule.
+  # Rationale + the code recipe: infra/ARCHITECTURE.md § "State model".
+  Memory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: !Sub '${AgentName}KnowledgeMemory'
+      Description: Per-user short-term memory for the Ripple assistant.
+      # Backstop TTL for stored turns. This bounds retention, NOT context size —
+      # a stateful agent still needs its own per-conversation turn/token cap.
+      EventExpiryDuration: !Ref MemoryExpiryDays
+      Tags: {project_name: !Ref ProjectTagValue}   # MAP shape
+
+  # ---------------------------------------------------------------------------
+  # GitHub OAuth2 credential provider (AgentCore Identity).
+  #
+  # ⚠️ Replacing this resource ISSUES A NEW CALLBACK URL (verified empirically:
+  # each provider gets a fresh UUID). The new URL must be pasted into the GitHub
+  # OAuth App or user auth breaks. Name and Vendor are createOnly, so changing
+  # either forces replacement. Read the CallbackUrl output after every deploy.
+  # ---------------------------------------------------------------------------
+  GithubProvider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Sub '${AgentName}-github'
+      CredentialProviderVendor: GithubOauth2
+      Oauth2ProviderConfigInput:
+        GithubOauth2ProviderConfig:
+          ClientId: !Ref GithubClientId
+          # Exactly one of these two paths applies; see the UseExternalSecret condition.
+          ClientSecretSource: !If [UseExternalSecret, EXTERNAL, MANAGED]
+          ClientSecretConfig: !If
+            - UseExternalSecret
+            - SecretId: !Ref GithubClientSecretArn
+              JsonKey: !Ref GithubClientSecretJsonKey
+            - !Ref 'AWS::NoValue'
+          ClientSecret: !If
+            - UseExternalSecret
+            - !Ref 'AWS::NoValue'
+            - !Ref GithubClientSecret
+      Tags:                                        # LIST shape
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  # ---------------------------------------------------------------------------
+  # Runtime execution role. Scoped to THIS project's resources only — unlike the
+  # hand-made AgentCoreRuntimeRole, which is shared with unrelated agents in this
+  # account and therefore could not carry a project cost tag.
+  # ---------------------------------------------------------------------------
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Ripple${AgentName}RuntimeRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      Policies:
+        - PolicyName: RippleRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeModel
+                Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+              - Sid: PullImage
+                Effect: Allow
+                Action:
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                Resource:
+                  !Sub
+                    - 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Repo}'
+                    - Repo: !Sub 'bedrock-agentcore-${AgentName}'
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Sid: Telemetry
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'   # neither service supports resource-level scoping here
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetWorkloadAccessToken'
+                  - 'bedrock-agentcore:GetWorkloadAccessTokenForJWT'
+                  - 'bedrock-agentcore:GetWorkloadAccessTokenForUserId'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*'
+              - Sid: OAuth2TokenAccess
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetResourceOauth2Token'
+                  - 'bedrock-agentcore:CompleteResourceTokenAuth'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/*'
+                  # GetResourceOauth2Token authorizes against TWO resource types, not
+                  # one: the token vault holding the credential AND the workload
+                  # identity of the calling runtime. Listing only the vault produced
+                  # AccessDeniedException naming the workload-identity ARN — the
+                  # action was present, so the policy looked correct at a glance.
+                  # These are the same ARNs as the WorkloadIdentity statement below;
+                  # they are repeated here because IAM evaluates each statement
+                  # independently — an action must appear in a statement that also
+                  # covers the resource, and the two do not combine.
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*'
+              # Only under ClientSecretSource=EXTERNAL. Choosing EXTERNAL moves the
+              # OAuth client secret out of CloudFormation and into a secret WE own,
+              # which also moves the read onto THIS role — AgentCore Identity reads
+              # it as the calling runtime, not as a service principal. Under MANAGED
+              # the service owns the secret and this statement must not exist, hence
+              # the condition: granting it unconditionally would hand the runtime
+              # read access to a secret ARN that may be blank or unrelated.
+              #
+              # Scoped to the ONE secret ARN passed in, never secretsmanager:* — this
+              # role is the agent's blast radius, and the whole point of the
+              # project-scoped role was to stop sharing broad permissions.
+              - !If
+                - UseExternalSecret
+                - Sid: ReadGithubClientSecret
+                  Effect: Allow
+                  Action: 'secretsmanager:GetSecretValue'
+                  Resource: !Ref GithubClientSecretArn
+                - !Ref 'AWS::NoValue'
+              - Sid: MemoryDataPlane
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:CreateEvent'
+                  - 'bedrock-agentcore:GetEvent'
+                  - 'bedrock-agentcore:ListEvents'
+                  - 'bedrock-agentcore:RetrieveMemoryRecords'
+                  - 'bedrock-agentcore:ListMemoryRecords'
+                  - 'bedrock-agentcore:GetMemoryRecord'
+                # Scoped to this stack's memory, not memory/*.
+                Resource: !GetAtt Memory.MemoryArn
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  # ---------------------------------------------------------------------------
+  # The runtime. AgentRuntimeName is createOnly -> renaming forces replacement.
+  # ---------------------------------------------------------------------------
+  Runtime:
+    Type: AWS::BedrockAgentCore::Runtime
+    # The provider is referenced only by name in EnvironmentVariables, which
+    # creates no implicit dependency — make it explicit.
+    DependsOn: GithubProvider
+    Properties:
+      AgentRuntimeName: !Ref AgentName
+      Description: Ripple Slack knowledge assistant (Strands + Bedrock, GitHub tool).
+      RoleArn: !GetAtt RuntimeRole.Arn
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      # A bare string in CFN — the boto3 API nests this as {serverProtocol: HTTP}.
+      ProtocolConfiguration: HTTP
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub
+            - '${RepoUri}:${Tag}'
+            - RepoUri: !ImportValue
+                'Fn::Sub': '${FoundationStackName}-EcrRepositoryUri'
+              Tag: !Ref ImageTag
+      # The runtime IS the secured front door — no ingress gateway needed for MVP.
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://${Auth0Domain}/.well-known/openid-configuration'
+          AllowedAudience: [!Ref Auth0Audience]
+      EnvironmentVariables:
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        # Provider Name is createOnly (not GetAtt-able) — rebuild the same value.
+        # DependsOn keeps the provider ordered ahead of the runtime regardless.
+        GITHUB_CREDENTIAL_PROVIDER: !Sub '${AgentName}-github'
+        GITHUB_SCOPES: !Ref GithubScopes
+        AGENTCORE_MEMORY_ID: !GetAtt Memory.MemoryId
+        # Consent return URL for the 3-legged flow. A CLI caller cannot supply the
+        # OAuth2CallbackUrl request header a browser front end would send, and without
+        # it GetResourceOauth2Token fails with "You must provide a
+        # ResourceOauth2ReturnUrl to proceed with this flow".
+        #
+        # This is where AgentCore sends the browser with a ?session_id=... that the
+        # CALLER must feed to CompleteResourceTokenAuth to vault the token — not a
+        # passive landing page, and not the provider callback
+        # (GithubProvider.CallbackUrl). See the ConsentReturnUrl parameter above;
+        # getting this wrong makes consent succeed at the vendor and vault nothing.
+        OAUTH_CALLBACK_URL: !Ref ConsentReturnUrl
+        # AWS_REGION is injected by the runtime; not set here to avoid a conflict.
+      Tags: {project_name: !Ref ProjectTagValue}   # MAP shape
+
+  RuntimeEndpoint:
+    Type: AWS::BedrockAgentCore::RuntimeEndpoint
+    Properties:
+      AgentRuntimeId: !GetAtt Runtime.AgentRuntimeId
+      Name: !FindInMap [Endpoint, Primary, Name]
+      Description: Primary endpoint for the Ripple assistant.
+      # PIN TO THE RUNTIME'S CURRENT VERSION. Omitting this is a silent trap that
+      # cost a full debugging session: without it the endpoint binds to whatever
+      # version existed when it was FIRST created (v1) and stays there forever.
+      # Publishing a new image bumps the Runtime to v2, v3, ... but none of THIS
+      # resource's properties change, so CloudFormation sees no drift, performs no
+      # update, and the endpoint keeps serving v1. Every redeploy appears to
+      # succeed while the code under test never changes — the worst kind of bug.
+      #
+      # `Runtime.AgentRuntimeVersion` is a readOnly attribute that returns the
+      # version this deploy just published, so referencing it both rolls the
+      # endpoint forward AND makes the dependency explicit to CFN.
+      AgentRuntimeVersion: !GetAtt Runtime.AgentRuntimeVersion
+      Tags: {project_name: !Ref ProjectTagValue}   # MAP shape
+
+Outputs:
+  RuntimeArn:
+    Description: Set as RIPPLE_RUNTIME_ARN in dev.env.
+    Value: !GetAtt Runtime.AgentRuntimeArn
+  RuntimeId:
+    Value: !GetAtt Runtime.AgentRuntimeId
+  RuntimeEndpointArn:
+    Value: !GetAtt RuntimeEndpoint.AgentRuntimeEndpointArn
+  EndpointName:
+    Description: Set as RIPPLE_RUNTIME_QUALIFIER in dev.env.
+    Value: !FindInMap [Endpoint, Primary, Name]
+  MemoryId:
+    Value: !GetAtt Memory.MemoryId
+  GithubCallbackUrl:
+    Description: >
+      PASTE THIS into the GitHub OAuth App's Authorization callback URL. It changes
+      whenever the credential provider is replaced.
+    Value: !GetAtt GithubProvider.CallbackUrl
+  RuntimeLogGroup:
+    Description: >
+      Log group the runtime writes to. Created by the service on first invoke, so
+      it is not a CFN resource; scripts/apply_tags.py tags it after deploy.
+    Value: !Sub
+      - '/aws/bedrock-agentcore/runtimes/${Id}-${Ep}'
+      - Id: !GetAtt Runtime.AgentRuntimeId
+        Ep: !FindInMap [Endpoint, Primary, Name]
