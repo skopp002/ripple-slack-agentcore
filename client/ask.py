@@ -7,13 +7,50 @@ Flow:
      then uses AgentCore Identity to mint the user's GitHub token and answers
      with inline citations + a High/Medium/Low confidence band.
 
-The user JWT is sent as the Authorization: Bearer header (that IS how the
-CUSTOM_JWT authorizer authenticates the caller). We also put it in the payload
-so the agent can read the 'sub' and drive the GitHub OBO consent per user.
+The user JWT travels in the Authorization: Bearer header and nowhere else. That is the
+value the CUSTOM_JWT authorizer authenticates, and it is also where the agent reads the
+caller's identity from, so there is exactly one identity channel per request.
 
 Usage:
     python client/ask.py "What is our 2026 roadmap?"
     python client/ask.py --force "..."      # force re-login first
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+
+This file is the other half of the `CLI client` tile, and it is where a reader following
+the badges enters and leaves the system. It receives 1a/1b (the question, as argv rather
+than a chat box — no source is named and no permission is requested, which is what makes
+the two flows indistinguishable at this point), performs 4a/4b, receives 13a/13b, and
+prints 14a/14b.
+
+4a/4b and 13a/13b are drawn against the `Ingress AgentCore Gateway`, which is dashed
+TARGET. Today invoke() POSTs straight at the runtime's own data-plane invocations
+endpoint, so the hop this file really makes is CLI -> AgentCore Runtime, an arrow the
+diagram does not draw at all, and step 5a/5b — the front door validating the JWT and
+forwarding — is performed by the runtime's own CUSTOM_JWT authorizer rather than by
+anything on the diagram's 5a/5b edge. The NOTE block says so in prose; the badges do
+not, so do not read 4a->5a as two hops when tracing against this code.
+
+The Bearer header set at 4a/4b is the ONLY identity this request carries — the body holds
+the question and nothing else. Step 6a therefore re-verifies the very token the authorizer
+already validated at 5a, which is not redundant: the authorizer proves the token is
+authentic, while 6a additionally requires `email_verified` to be TRUE and the address to
+be inside the domain allowlist before that address may become an impersonation subject.
+Neither of those two gates is drawn on the canvas.
+
+THE CONSENT FLOW RUNS THROUGH HERE IN A WAY THE DIAGRAM DOES NOT SHOW. 8b is drawn as
+the vault redirecting the user's browser, but by the time consent is needed this
+invocation has already returned — the runtime never holds the request open for a human
+(see agent.py's NoWaitTokenPoller), so the authorization URL travels back to this
+process in `auth_required` over 11b/12b/13b and it is _render() below that opens the
+browser on it. On the canvas that makes the CLI tile look absent from flow B between 4b
+and 13b, when in fact this file is the only thing that turns a returned URL into the ★
+step happening at all. After consent completes it re-invokes: a second full 4b->13b pass
+the numbering shows once, because the user asked a question, not for a browser tab.
+
+Only VAULTED sources can appear in `auth_required`; a DELEGATED source (Google Drive,
+flow A) has no consent step anywhere, which is why nothing in the block below can ever
+open a browser for the green path.
 """
 import argparse
 import json
@@ -49,7 +86,12 @@ def invoke(prompt: str, access_token: str, session_id: str) -> dict:
         # Session id groups turns for the same user conversation (>=33 chars).
         "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
     }
-    body = {"prompt": prompt, "access_token": access_token}
+    # The body carries the QUESTION only. The user's identity travels in the
+    # Authorization header above, which is the value the CUSTOM_JWT authorizer
+    # authenticates — the agent reads it from there (agent.py `_caller_jwt`). Sending the
+    # token in the body as well would create a second, unauthenticated identity channel
+    # that could name a different user than the header does.
+    body = {"prompt": prompt}
     params = {"qualifier": QUALIFIER}
     r = requests.post(url, headers=headers, params=params, json=body, timeout=120)
     if r.status_code != 200:
@@ -84,6 +126,10 @@ def _render(resp: dict, args, prompt: str, access_token: str,
     # with no sources, drive the one-time consent to completion. A dict keyed by
     # source, because the target state has four (Databricks Genie, Confluence,
     # Slack, Google Drive) and a user may need to authorize several.
+    # Only VAULTED sources can ever appear here. A DELEGATED source (Google Drive) has
+    # no consent step at all, so it is absent from `auth_required` by construction —
+    # the agent reports its kind in `source_flows` rather than inventing a consent URL
+    # for a path that has none. See agent.py's `source_flows` comment.
     pending = resp.get("auth_required") or {}
     if pending:
         print("-" * 60)
@@ -134,12 +180,28 @@ def _render(resp: dict, args, prompt: str, access_token: str,
     # from a LOW-confidence answer.
     broken = resp.get("source_errors") or {}
     if broken:
+        flows = resp.get("source_flows") or {}
         print("-" * 60)
         print(f"{len(broken)} source(s) could not be reached — not a consent issue:")
         for source, err in sorted(broken.items()):
             print(f"  {source}: {err}")
         print("\nThis is a configuration or plumbing fault, not something the user "
               "can authorize away. Check the runtime logs.")
+        # A DELEGATED source needs different advice from a vaulted one: there is no
+        # consent to complete and no token to refresh, so the cause is either the
+        # admin-side delegation grant or a missing claim in the caller's token. Saying
+        # "check the runtime logs" alone sends someone hunting in the wrong place.
+        delegated = [s for s in broken if flows.get(s) == "DELEGATED_SUBJECT"]
+        if delegated:
+            print(f"\n{', '.join(sorted(delegated))} use(s) admin-delegated "
+                  "impersonation (no user consent exists to fix). Likely causes:")
+            print("  - the caller's token carries no verified 'email' claim")
+            print("  - the email is not the Workspace PRIMARY address (an alias "
+                  "fails rather than resolving)")
+            print("  - the domain-wide delegation grant is missing, or its scope "
+                  "list does not match")
+            print("  Verify the admin side independently:")
+            print("    python3 scripts/verify_drive_delegation.py <user-email>")
         if not resp.get("connected_sources"):
             return 4
     return 0

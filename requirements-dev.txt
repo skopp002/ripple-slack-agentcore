@@ -2,6 +2,14 @@
 # regenerating diagrams. NOT installed into the container image; that is
 # requirements.txt, which is deliberately kept to the agent's runtime needs only.
 #
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# Nothing here runs inside any drawn tile. It equips the machine that stands OUTSIDE
+# the diagram: the `CLI` tile's client code (steps 2/3/4 and 13/14 in both flows), the
+# deploy path that builds the plane the diagram draws as S3 -> CB -> ECR, and matplotlib
+# for redrawing the diagram itself. The split from requirements.txt is deliberate — a
+# single merged file would ship a plotting stack into every container for the sake of
+# two local scripts.
+#
 # Why a second file: `pip install -r requirements.txt` inside the image must not
 # pull matplotlib. A single merged file would ship a plotting stack into every
 # container for the sake of two local scripts.

@@ -4,6 +4,35 @@ The per-user GitHub token is obtained by AgentCore Identity (see agent.py's
 @requires_access_token with USER_FEDERATION / 3-legged OAuth consent). Because the
 token belongs to the signed-in user, GitHub returns ONLY repos/code that user can
 access — this is the native permission trim, enforced by GitHub, not by us.
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+
+This module is the far end of the CONSENT FLOW — steps 9b and 10b, against the `GH`
+(GitHub MCP / API) tile, both tagged EXTENSION because this path works and is
+deliberately not the one being demonstrated. It has no tile of its own; it is a module
+inside the `RT` container, and the diagram carries its behaviour on those two arrows.
+9b is every requests.get() below, made with the user's OWN OAuth token — this file
+never sees how that token was obtained and never refreshes one, which is the whole
+value of the vault sitting between it and GitHub. 10b is the trim, and as with the
+Drive source there is no code here that performs it: GitHub decides, and `fetch_document`
+reports a 404 as "not found or not permitted" precisely because GitHub conflates the two
+and inventing a distinction would be a lie about who authorized what.
+
+Nothing in this file performs 7b or 8b, and it cannot see the ★ either — by the time
+`search_github` is called the consent has already happened, possibly several turns ago.
+What it does have is the case the diagram gives no step to: `github_token` empty, which
+is what a first-time user's turn actually looks like. Every entry point below returns an
+`{"error": "GitHub not connected. Consent required."}` shape rather than raising, so the
+turn still answers from whatever other source is live. On the diagram that is a green
+1a->14a walk with an orange gap in it, which no single flow's numbering can express.
+
+`_search_scope()` corresponds to no arrow at all, and that absence is worth naming here
+because the diagram invites the wrong inference. 10b's sentence says GitHub returns "only
+what this user's own grants allow", which is true and is a SECURITY property; it is not a
+relevance property. /search/code with no qualifier searches all public code on GitHub,
+correctly trimmed and completely useless — see that function's own comment. A reader who
+took 10b as the full account of what comes back would omit the scoping and get an agent
+that cites strangers' repositories while every check the diagram makes still holds.
 """
 import requests
 

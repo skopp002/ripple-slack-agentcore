@@ -28,6 +28,37 @@ Two constraints on the return URL, both enforced elsewhere:
   - it must match what the agent passes as `callback_url`
     (OAUTH_CALLBACK_URL on the runtime, from the ConsentReturnUrl CFN parameter),
 so all three are derived from CONSENT_PORT/CONSENT_PATH here to keep them in sync.
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+
+This file belongs to the `CLI client` tile — a third module the tile's caption does not
+name — and it exists ENTIRELY IN THE CONSENT FLOW. It has no counterpart in flow A and
+never runs for it, because a DELEGATED source has no consent to complete.
+
+Its position is best described as the return leg of 8b that the diagram does not draw.
+8b is the vault redirecting a browser to GitHub's consent screen and ★ is the user
+clicking Approve; what happens next is that GitHub redirects to the AgentCore-hosted
+provider callback, the code is exchanged, and AgentCore then sends the browser to
+CONSENT_RETURN_URL below with a `session_id`. So this loopback server sits strictly
+AFTER ★ and completes 8b's round trip — the round trip whose existence is precisely why
+flow_numbering() refused to let ★ be numbered 9b.
+
+The consequence is an arrow that should exist on the canvas and does not: the
+complete_resource_token_auth() call at the bottom of this file is a CLI -> AgentCore
+Identity token vault hop, and it is the hop that puts the token in the vault. The
+diagram goes 8b (vault redirects) straight to 9b ("GitHub is called under the user's OWN
+OAuth token, vaulted after they approved"), which reads as though approval alone vaults
+it. It does not. Without the call below the session stays IN_PROGRESS forever, nothing is
+ever vaulted, and 9b can never happen — the failure this whole docstring is about. A
+reader tracing flow B on the PNG cannot see the one step that makes 9b's precondition
+true.
+
+Second thing the canvas cannot show: ★ is drawn USER -> GitHub OAuth App, deliberately,
+to point at a human's attention. In this code the browser is opened by the CLI
+(webbrowser.open below, or the URL is printed for another profile), so the machine hop
+underneath ★ is CLI -> GitHub. That is a documented choice in the diagram, not an error
+in it, but it is why the CLI appears to do nothing during the one part of flow B it is
+in fact driving end to end.
 """
 import http.server
 import threading

@@ -1,5 +1,13 @@
 # Ripple agent build context — OWNED BY THIS REPO, not toolkit-generated.
 #
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# The build plane, between `S3` (build source) and `ECR` — it bounds what `CB`
+# (CodeBuild) is even shown. Not on either request flow, and it carries no step
+# number, because the build plane is infrastructure rather than a step a question
+# walks through. The security relevance is one-directional: an image in `ECR` is what
+# the `RT` tile runs, so anything that leaks into the context is inside the trust
+# boundary from then on.
+#
 # The Dockerfile COPYs an explicit allowlist (requirements.txt + agent/), so
 # nothing here is load-bearing for correctness. It stays as defence in depth: if
 # someone later replaces those COPYs with `COPY . .`, these rules are what stops

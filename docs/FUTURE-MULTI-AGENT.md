@@ -5,6 +5,17 @@ into a **multi-agent system** that shares memory (notably **episodic** memory).
 Nothing here is required for the MVP; it's the roadmap so today's build doesn't
 box us in.
 
+> **Where this sits in the architecture diagram
+> (`../infra/architecture-components.png`):** nowhere yet, deliberately. Everything
+> described here lives behind the `MEM` (AgentCore Memory) tile, which the runtime
+> stack *creates* and injects but which no code path reads — the solution is stateless
+> at every layer today, so `MEM` carries no step number in either flow. The one
+> constraint this file must respect, and the reason it is worth reading before adding
+> a second agent: every namespace has to derive from the **verified** identity that
+> steps `5`/`6a` establish. A shared namespace keyed on anything a caller can influence
+> would let one user's history be read as another's, which is the same failure mode as
+> an unverified impersonation subject, arriving by a different door.
+
 > Grounding: AgentCore Memory (SDK `MemorySessionManager`) already exposes the
 > primitives this needs — **actors**, **sessions/events** (short-term), and
 > **long-term memory records** organized by **namespace**, with

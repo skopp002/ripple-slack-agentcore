@@ -9,6 +9,60 @@ Description: >
   OAuth2CredentialProvider takes a LIST ([{Key:, Value:}]). Both appear below;
   this is schema-mandated, not an oversight.
 
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# this template declares almost every tile inside the purple "Amazon Bedrock
+# AgentCore (managed — no Lambda, no API Gateway)" box, and it is the only file that
+# puts anything on the request path.
+#
+# WHAT IT CREATES, tile by tile. "AgentCore Runtime" (RT) is the Runtime plus its
+# RuntimeEndpoint below — the endpoint is deliberately NOT its own tile, because it is
+# an addressable alias on the runtime rather than a deployable component, which is why
+# the diagram carries it as a sub-caption. "AgentCore Memory" (MEM, "STM, actorId =
+# Okta sub, 90d") is the Memory resource. The "AgentCore Identity token vault" tile
+# (VAULT) is a per-account service resource this stack does not create, but
+# GithubProvider is what makes it usable: the OAuth2CredentialProvider is the vault
+# entry behind steps 8b and 9b, and the RuntimeRole statements OAuth2TokenAccess and
+# WorkloadIdentity are what let the runtime read from it at all. The IAM roles get no
+# tile either — a role is a permission on an existing tile, not a component, and
+# drawing one would imply a fourth managed service sitting between the runtime and
+# everything it calls.
+#
+# WHICH NUMBERED STEPS THESE PERFORM. The runtime is the actor in 5a/5b (it receives
+# the forwarded request), 6a (it re-verifies the caller's JWT ITSELF against the IdP's
+# JWKS before naming an impersonation subject — the step numbered 'a' only, because
+# the consent flow never needs it), 7a/6b (it calls its tools carrying that verified
+# identity) and 12a/12b (it grounds the answer in what came back and attaches
+# citations). Memory is on no numbered step at all: its tile is drawn solid because
+# the resource exists, and the read/write arrow to it is an unnumbered infrastructure
+# edge — see the comment on the Memory resource, which is provisioned and not yet
+# read. The vault performs 7b, 8b and 9b, all of which are drawn dashed or as the
+# consent EXTENSION.
+#
+# WHAT THIS TEMPLATE DOES NOT CREATE, though the diagram draws it. Both Gateways are
+# tagged TARGET and dashed: there is no ingress gateway resource here, so the
+# AuthorizerConfiguration below IS the front door the diagram assigns to the "Ingress
+# AgentCore Gateway" tile (inbound auth: validate the IdP's JWT), and there is no
+# tools gateway, so the agent calls its tools in-process rather than through the
+# "Tools AgentCore Gateway" tile that steps 7a/8a/10a/11a route through. The
+# Okta-guarded MCP server (also TARGET) has no resource here at all. Neither does the
+# Slack front door (DEFERRED). Secrets Manager appears as a tile because two
+# credentials live there, but this stack only takes their ARNs as parameters and
+# grants scoped reads — GithubClientSecretArn and GoogleSaSecretArn are created by
+# hand, out of band, exactly so the values never enter CloudFormation history.
+# Everything in the build-plane zone belongs to 01-foundation.yaml and is reached here
+# only through the FoundationStackName import. The CloudWatch tile is a service the
+# runtime reports into (the Logs and Telemetry statements below are the whole of this
+# template's relationship to it); the runtime's own log group cannot be declared at
+# all, which is why it is an Output for scripts/apply_tags.py rather than a resource.
+#
+# ONE NAMING GAP A READER SHOULD EXPECT. The tile the diagram calls "Okta (OIDC IdP)"
+# is external and created nowhere in this repo, but it is POINTED AT from here — by
+# Auth0Domain/Auth0Audience, which build both the authorizer's DiscoveryUrl and the
+# agent's IDP_ISSUER/IDP_AUDIENCE. The parameters are named for Auth0 and the diagram
+# is drawn for Okta; nothing here is Auth0-specific beyond the names, since
+# identity_claims.py reads the issuer and JWKS URI out of the discovery document
+# rather than guessing Auth0's URL shape.
+
 Parameters:
   FoundationStackName:
     Type: String
@@ -74,6 +128,72 @@ Parameters:
     Type: String
     Default: 'repo read:org'
 
+  GithubAuthFlow:
+    Type: String
+    Default: 'USER_FEDERATION'
+    AllowedValues:
+      - USER_FEDERATION
+      - ON_BEHALF_OF_TOKEN_EXCHANGE
+    Description: >
+      Token path for GitHub. USER_FEDERATION = one-time per-user consent, with a
+      refresh token vaulted by AgentCore Identity. ON_BEHALF_OF_TOKEN_EXCHANGE = RFC
+      8693 exchange of the user's IdP token, so the user NEVER sees a consent screen.
+      Both end at the same guarantee (the API call runs as the user, so native ACLs
+      trim results); they differ in who consents and who holds long-lived credentials.
+      LEAVE THIS AT USER_FEDERATION FOR GITHUB. GitHub's token endpoint rejects the
+      exchange grant with `unsupported_grant_type` (verified empirically), so OBO
+      cannot work against it regardless of how identity is arranged. The parameter
+      exists so a source can be migrated between paths by CONFIG rather than a code
+      change (requirement FR-34), which is what makes an Okta-federated source such as
+      Google Drive or Slack switchable without touching the agent.
+
+  # ---- Google Drive / Docs (the no-consent path) ----
+  GoogleSaSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. ARN of a Secrets Manager secret holding the Google SERVICE ACCOUNT
+      JSON KEY used for domain-wide delegation. Setting this ENABLES the Drive source;
+      leaving it empty disables it (the agent skips the row, GitHub still works).
+      Only the ARN travels through CloudFormation — the key itself never enters this
+      template or stack history.
+      ⚠️ ADMIN-LEVEL CREDENTIAL. A delegated service account can impersonate ANY user
+      in the Workspace domain for the granted scopes, so the grant must be read-only
+      and minimal (drive.readonly). Treat loss of this key as a domain-wide
+      compromise. Setup: docs/GOOGLE-DRIVE-OKTA-SETUP.md.
+      NOTE: no GoogleScopes parameter exists on purpose. Google scopes are authorized
+      ONCE by a Workspace super-admin in the domain-wide delegation grant, not
+      requested per call, so a template parameter would be a value that silently does
+      nothing. agent/gdrive_tool.py pins the scope it asks for.
+
+  AllowedEmailDomains:
+    Type: String
+    Default: ''
+    Description: >
+      REQUIRED WHENEVER GoogleSaSecretArn IS SET (the condition below enforces it).
+      Comma-separated list of email domains that may be impersonated, e.g.
+      "yourdomain.com". This is a SECOND, independent gate on the impersonation
+      subject, and it is not redundant with claim verification: a verified token
+      proves the token is authentic, NOT that its holder is entitled to the mailbox
+      it names. Any client the issuer will sign for — including a self-registered
+      account in another tenant of the same issuer — would otherwise be an acceptable
+      subject. The delegation grant is per Workspace domain, so anything outside this
+      list could never be legitimate. There is no permissive default because the only
+      possible default is "every address this issuer will sign for".
+
+  TrustUnverifiedEmailClaim:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Leave 'false'. Setting it 'true' makes an ABSENT `email_verified` claim
+      acceptable, which is how a self-registered, never-confirmed address
+      (ceo@yourdomain.com) becomes an impersonation subject with nothing forged. Set
+      it only for a directory-sourced IdP that cannot emit the claim AND where
+      self-signup is impossible; with it on, AllowedEmailDomains is the only thing
+      left between an unconfirmed account and another user's Drive. An EXPLICIT
+      `email_verified: false` is rejected either way.
+
   ConsentReturnUrl:
     Type: String
     Default: 'http://localhost:8799/consent'
@@ -105,6 +225,23 @@ Parameters:
 
 Conditions:
   UseExternalSecret: !Not [!Equals [!Ref GithubClientSecretArn, '']]
+  UseGoogleDrive: !Not [!Equals [!Ref GoogleSaSecretArn, '']]
+
+# Enforced at CREATE/UPDATE time, before any resource is touched — a stack that
+# would deploy an unbounded impersonation subject is rejected rather than deployed
+# and then noticed. The agent ALSO fails closed on an empty allowlist
+# (identity_claims.py GATE 2); this exists so the failure arrives at deploy time
+# with an actionable message, instead of at answer time as "Drive is broken".
+Rules:
+  DriveRequiresDomainAllowlist:
+    RuleCondition: !Not [!Equals [!Ref GoogleSaSecretArn, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AllowedEmailDomains, '']]
+        AssertDescription: >
+          AllowedEmailDomains must be set when GoogleSaSecretArn is set. The Google
+          source impersonates users by email, and with no domain allowlist the set of
+          acceptable subjects is every address the IdP will sign for — including
+          accounts in domains this Workspace delegation does not cover.
 
 Mappings:
   Endpoint:
@@ -269,6 +406,19 @@ Resources:
                   Action: 'secretsmanager:GetSecretValue'
                   Resource: !Ref GithubClientSecretArn
                 - !Ref 'AWS::NoValue'
+              # The Google service-account key, read by agent/gdrive_tool.py at first
+              # use and cached per process. Conditional and scoped to the ONE ARN:
+              # this key can impersonate any user in the Workspace domain, so it is
+              # the single most sensitive value the runtime touches. Granting it
+              # unconditionally would hand the runtime a read on an ARN that may be
+              # blank or belong to something unrelated.
+              - !If
+                - UseGoogleDrive
+                - Sid: ReadGoogleServiceAccountKey
+                  Effect: Allow
+                  Action: 'secretsmanager:GetSecretValue'
+                  Resource: !Ref GoogleSaSecretArn
+                - !Ref 'AWS::NoValue'
               - Sid: MemoryDataPlane
                 Effect: Allow
                 Action:
@@ -316,6 +466,36 @@ Resources:
         # DependsOn keeps the provider ordered ahead of the runtime regardless.
         GITHUB_CREDENTIAL_PROVIDER: !Sub '${AgentName}-github'
         GITHUB_SCOPES: !Ref GithubScopes
+        # Read by agent.py `_flow_for`. Naming contract: <SOURCE_KEY>_AUTH_FLOW, so a
+        # new source needs no agent change — only a new parameter + env var here.
+        GITHUB_AUTH_FLOW: !Ref GithubAuthFlow
+        # Setting this ENABLES the Google Drive source. Empty string = disabled, which
+        # agent.py treats as "skip the row" (see _is_enabled).
+        GOOGLE_SA_SECRET_ARN: !Ref GoogleSaSecretArn
+        # ---- claim verification for DELEGATED sources ----------------------------
+        # Read by agent/identity_claims.py to re-verify the caller's JWT before its
+        # `email` claim is used as an impersonation subject.
+        #
+        # DERIVED FROM THE SAME PARAMETERS AS THE AUTHORIZER BELOW, deliberately, so
+        # in-agent verification can never be weaker than the front door's. If these
+        # were their own parameters someone would eventually point them at a different
+        # tenant, and the agent would happily impersonate users vouched for by an
+        # issuer the runtime does not actually trust.
+        #
+        # The trailing slash is Auth0's form. It is NOT load-bearing any more:
+        # identity_claims reads the authoritative `issuer` from the same OIDC
+        # discovery document the authorizer uses (DiscoveryUrl below) and compares to
+        # this one ignoring a trailing slash. That matters for Okta, whose `iss`
+        # carries no trailing slash and whose JWKS is at <issuer>/v1/keys, not
+        # /.well-known/jwks.json — the agent used to GUESS that path, so against Okta
+        # it failed where the authorizer succeeded. Same document now, both sides.
+        IDP_ISSUER: !Sub 'https://${Auth0Domain}/'
+        IDP_AUDIENCE: !Ref Auth0Audience
+        # SECOND gate on the impersonation subject — see the parameter descriptions.
+        # A verified token proves authenticity, not entitlement to the mailbox it
+        # names; these two bound who can ever be impersonated.
+        ALLOWED_EMAIL_DOMAINS: !Ref AllowedEmailDomains
+        TRUST_UNVERIFIED_EMAIL_CLAIM: !Ref TrustUnverifiedEmailClaim
         AGENTCORE_MEMORY_ID: !GetAtt Memory.MemoryId
         # Consent return URL for the 3-legged flow. A CLI caller cannot supply the
         # OAuth2CallbackUrl request header a browser front end would send, and without

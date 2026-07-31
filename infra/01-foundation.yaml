@@ -7,6 +7,32 @@ Description: >
   requires a ContainerUri that already exists in ECR. So the build plane lives here
   and 02-runtime.yaml consumes the resulting image tag as a parameter.
 
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# this template draws the whole BUILD PLANE zone and nothing else. The three tiles
+# inside the green box labelled "Build plane (CI) — CloudFormation stack 1" are the
+# S3 build source, CodeBuild and the ECR repository declared below; that zone label
+# names this file. The CodeBuild execution role and its log group get no tile of
+# their own — the log group's contents are what the "CloudWatch / AgentCore
+# Observability" tile means by "build logs", and that tile is drawn OUTSIDE the
+# build-plane box on purpose, because CloudWatch is a separate service both CodeBuild
+# and AgentCore report into rather than a member of either.
+#
+# NONE OF THESE TILES CARRIES A STEP NUMBER, and the omission is load-bearing: the
+# build plane SHIPS the agent, it is not a hop in either request flow. Its arrows
+# (S3 -> CodeBuild "source.zip", CodeBuild -> ECR "push arm64 image", ECR ->
+# AgentCore Runtime "container image") are therefore drawn thin and labelled inline,
+# because there is no badge for a reader to look up in either step table. If a
+# number ever appears on one of them, either the diagram or this stack has started
+# claiming that answering a user's question rebuilds a container.
+#
+# The single edge that leaves the zone is ECR -> AgentCore Runtime, and it too is
+# deploy-time: 02-runtime.yaml imports EcrRepositoryUri from the exports below and
+# pins a tag scripts/cfn_build.py produced. Nothing declared here is on the request
+# path, sees a user identity, or reads a token — which is why no arrow from any of
+# these tiles reaches Okta, the token vault, Google or GitHub, and why the ARM64
+# choice below (Environment.Type, required by AgentCore Runtime) is the only fact
+# about this stack the request path can observe at all.
+
 Parameters:
   AgentName:
     Type: String

@@ -9,6 +9,25 @@ AWS::BedrockAgentCore::Runtime requires a ContainerUri that already exists. So:
 Replaces the starter toolkit's Runtime.launch(): same CodeBuild -> ECR path, but
 driven against the CFN-managed project so nothing is created outside the stacks.
 
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+this script DRIVES the build plane zone and appears on it only as motion, never as a
+tile. It walks the three unnumbered arrows in that green box left to right — it writes
+source.zip into the S3 build source, starts the CodeBuild project, and CodeBuild
+pushes the arm64 image into the ECR repository whose tag 02-runtime.yaml then pins so
+the "container image" arrow into the AgentCore Runtime tile points at something that
+exists.
+
+It carries no step number because the build plane carries none: those three arrows
+are deploy-time infrastructure, drawn thin and labelled inline precisely because they
+are not hops in either request flow. This script reads no user identity, touches no
+token vault, and creates nothing — every AWS resource it uses was declared by
+01-foundation.yaml and is looked up through that stack's outputs.
+
+The narrow INCLUDE list below is what keeps it that way. The zip carries the
+Dockerfile, requirements.txt and agent/ and nothing else, so dev.env cannot travel
+into a build log or an image layer — the credentials the diagram routes through the
+Secrets Manager tile stay reachable only by ARN at runtime.
+
 Usage:
     source dev.env
     python3 scripts/cfn_build.py [--foundation-stack ripple-foundation]

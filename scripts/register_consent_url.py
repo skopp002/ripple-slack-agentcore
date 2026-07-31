@@ -18,6 +18,21 @@ The URL registered here MUST match, byte for byte:
     which is what the agent passes as `callback_url`.
 A mismatch fails at the last hop of consent, after the user has already approved.
 
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png): it
+configures the WorkloadIdentity that the "AgentCore Runtime" tile owns implicitly, and
+it exists entirely for the sake of step 8b — the "AgentCore Identity token vault" tile
+redirecting the user's browser to GitHub's consent screen. That is the one arrow on the
+canvas whose round trip comes back through a URL our own code has to serve, which is
+what this allowlist governs.
+
+Not a request-path step, and it has no tile of its own: a workload identity is a
+property of the runtime, not a component beside it. But get it wrong and the ★ human
+action — the only place on this diagram where a person acts — is wasted, because the
+failure lands at the LAST hop, after the user has already read the consent screen and
+clicked Approve. Nothing before 8b notices, and nothing in the OBO flow depends on this
+at all: the Google Drive path (8a-10a) never redirects a browser anywhere, so it works
+whether this script has been run or not.
+
 Run after every deploy that creates or replaces the runtime:
     python3 scripts/register_consent_url.py
 """

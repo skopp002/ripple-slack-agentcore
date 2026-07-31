@@ -8,6 +8,29 @@ Usage:
     python client/login.py                 # interactive: prints URL+code, polls
     python client/login.py --print-token   # also print the raw access token
 The token is cached at client/.token.json and reused until it expires.
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+
+This file is half of the `CLI client` tile. It performs steps 2a/2b — the device-code
+login, ONCE for the session and not once per source, which is the property the badge's
+own sentence is making — and receives 3a/3b, the signed JWT whose `email` claim every
+per-user decision downstream traces back to (it is the value step 8a puts in an
+impersonation assertion). All four badges are drawn neutral dark rather than green or
+orange because both flows perform them identically: logging in is not where the OBO and
+consent paths differ, and the cached token here is the same token either one carries.
+
+The diagram names that hop "against Okta". The claim is IdP-agnostic and the runtime's
+verification side genuinely is (agent/identity_claims.py reads OIDC discovery rather
+than guessing a JWKS path), but the endpoints below are not — they are Auth0's
+device-code paths, so the tile should not be read as evidence that this file runs
+against Okta unmodified.
+
+Nothing in either flow belongs to this file after 3a/3b, and in particular no
+verification does. The unverified decodes below exist only to print a `sub` and an
+`email` for a human; the checks the diagram numbers 5a/5b (front door) and 6a (the
+runtime, against the same JWKS) are the ones that decide anything, and a client-side
+check would prove nothing to either of them because the client is the party they are
+guarding against.
 """
 import argparse
 import json

@@ -1,24 +1,37 @@
 """Ripple Knowledge Assistant — AgentCore Runtime agent (harness entrypoint).
 
 Architecture (real):
-  Auth0 user JWT (from ingress gateway / caller)
+  user IdP JWT (Okta / Auth0, from the caller or an ingress front end)
     -> BedrockAgentCoreApp entrypoint (this file, on AgentCore Runtime)
-    -> AgentCore Identity mints a per-user token PER SOURCE via 3-legged OAuth
-       consent (USER_FEDERATION), vaulted + refreshed.
-    -> Strands agent (Claude Opus 4.8 on Bedrock) with one search tool that fans
-       out across every source this user has connected
+    -> a per-user credential PER SOURCE, by one of two mechanisms:
+         DELEGATED_SUBJECT  the source impersonates the user by VERIFIED EMAIL.
+                            No consent screen, ever. Google Drive works this way.
+                            THIS IS THE PRIMARY PATH.
+         VAULTED_OAUTH      AgentCore Identity brokers a per-user OAuth token,
+                            vaulted + refreshed. One-time consent per user per
+                            source. GitHub works this way — an EXTENSION, kept
+                            because not every vendor can be reached without it.
+    -> Strands agent (Claude on Bedrock) with three tools that each fan out across
+       every source this user has available
     -> answer with inline citations + High/Medium/Low confidence band
-  Per-user memory via AgentCore Memory, partitioned by the Auth0 'sub'.
+  Per-user memory via AgentCore Memory, partitioned by the IdP 'sub'.
 
-DATA SOURCES: GitHub is implemented; Databricks Genie (MCP), Confluence, Slack, and
-Google Drive are the target state. Everything here iterates over the SOURCES table
-below, so adding one is a table entry plus its credential provider — not a change to
-invoke(), the response shape, or the client. See the comment on SOURCES.
+DATA SOURCES: Google Drive/Docs and GitHub are implemented; Databricks Genie (MCP),
+Confluence and Slack are the target state. Everything here iterates over the SOURCES
+table below, so adding one is a table entry plus its credential wiring — not a change
+to invoke(), the response shape, or the client. See the comment on SOURCES.
 
-Permission trim: each token belongs to the signed-in user, so each source returns
-ONLY what that user can access. The trim is enforced BY THE SOURCE, not by us, and
-that must stay true for every source added — never a service account, never our own
-filtering. A user who hasn't connected a source simply gets no hits from it.
+Permission trim: the call to each source runs AS THE USER, so each source returns ONLY
+what that user can access. The trim is enforced BY THE SOURCE, not by us, and that must
+stay true for every source added — never a service account's own view, never our own
+filtering. A user who has no credential for a source simply gets no hits from it.
+
+⚠️ THE ONE INVARIANT THAT MUST NOT BREAK. A delegated source can reach ANY user in the
+domain; only the subject we pass narrows it to one. That subject must always come from
+identity_claims.verified_email() (signature + issuer + audience verified), never from
+the unverified `_user_sub()` decode and never from anything the caller supplies
+directly. Get this wrong and the per-user trim silently becomes a domain-wide read
+while every log line still looks correct.
 
 STATE MODEL: STATELESS PER INVOCATION.  <-- deliberate; see `invoke()` below
 Every call to the entrypoint builds a fresh Agent and answers from the prompt
@@ -37,6 +50,49 @@ Deployed by CloudFormation: `python3 scripts/deploy.py` (or the equivalent
 `aws cloudformation deploy` calls in infra/README.md). The starter toolkit is no
 longer used anywhere in this repo — note that the `bedrock_agentcore` imports
 below are the SDK, a different package that is NOT deprecated.
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+
+This file IS the `RT` (AgentCore Runtime) tile. identity_claims.py, gdrive_tool.py and
+github_tool.py get no tiles of their own on purpose — they are modules inside this
+container, and drawing them as peers of managed services would imply they are
+separately deployable. On the prefix both flows share, this file performs 5a/5b: the
+diagram puts front-door JWT validation on the `IGW` tile, but that tile is TARGET, so
+today the Runtime's own CUSTOM_JWT authorizer IS the front door and the `IGW`->`RT`
+arrow is an alias for the invocations endpoint this file is served on. `invoke()` then
+performs 6a by calling verified_email() before any delegated source is touched, 7a/6b
+by dispatching the tools (the `RT`->`TGW` arrow, drawn through the TARGET tools gateway;
+the calls are in-process), and 11a/11b plus 12a/12b on the return lane.
+
+7b IS NOT WHAT THIS FILE DOES, and the mismatch is not a detail. The diagram numbers
+flow B's next step as an RFC 8693 exchange of the user's Okta JWT "with no user
+interaction", then numbers 8b as the vault having no token and redirecting to consent —
+which cannot both happen. The code takes the second: GitHub's row in SOURCES resolves to
+USER_FEDERATION, because GitHub answers `unsupported_grant_type` to the exchange grant
+and no arrangement of identity changes that. The combination 7b then 8b describes is one
+`_capture` below treats as a POLICY failure and deliberately refuses to show a user
+(FR-5a), so a reader tracing flow B as numbered is tracing a sequence this file classes
+as a bug. The exchange edge is real but belongs to the `MCP` tile, which is TARGET.
+
+Two things the diagram draws around this file that the code does not do, so do not
+read them as descriptions of `invoke()`. The `RT`->`MEM` "read / write events" arrow is
+solid and untagged, but MEMORY_ID is provisioned and unused and every turn is
+stateless — nothing here reads or writes AgentCore Memory, and no actorId is ever set.
+And 8b is drawn as the vault redirecting the user's browser; what actually happens is
+that `_capture` catches the URL and `result["auth_required"]` hands it back to the
+caller, because NoWaitTokenPoller refuses to hold the request open. The consequence for
+reading the diagram is that flow B's 1b->14b cannot be walked inside one invocation: a
+first-time user gets the entire return lane WITH a consent URL attached, and 9b happens
+on their next question, after the client has completed the session out of band.
+
+The numbering also makes the two flows look like alternatives, and in this file they
+are not. `search_company_documents` fans out over every row of ENABLED and merges the
+hits, so a single question can run 8a-10a and 9b-10b in the same turn; the `credential`
+kind in SOURCES, not the diagram's per-source arrows, is what decides which mechanism
+each row uses. Finally, the diagram has no edge into `CloudWatch` at all, which hides a
+lane this file deliberately relies on: when claim verification fails the caller gets a
+generic refusal and the REASON goes only to the log, so the print() calls below are the
+only place that failure is diagnosable.
 """
 import asyncio
 import json
@@ -57,6 +113,7 @@ from strands import Agent, tool
 from strands.models import BedrockModel
 
 from github_tool import fetch_document, list_sources, search_github
+from identity_claims import ClaimVerificationError, verified_email
 
 # ---- config (from injected runtime env; no baked-in defaults) --------------
 def _require(name: str) -> str:
@@ -89,19 +146,27 @@ if not REGION:
         "the boto3 session default is set on this runtime"
     )
 
-# Where AgentCore sends the USER'S BROWSER once it has vaulted the token, i.e. a
-# landing page. Two URLs are easy to confuse here, and swapping them silently breaks
-# the final hop of consent:
+# Where AgentCore sends the USER'S BROWSER as the LAST hop of consent. Two URLs are
+# easy to confuse here, and swapping them silently breaks the final hop:
 #
 #   provider callback   .../identities/oauth2/callback/<uuid>  — receives GITHUB's
 #                       redirect, carrying ?code=&state=. Goes in the vendor's OAuth
 #                       app. NOT this value.
-#   return url (this)   where the user lands AFTER the token is vaulted. Consent is
-#                       already finished; nothing is appended to it.
+#   return url (this)   a callback into OUR OWN application. AgentCore appends
+#                       ?session_id=<urn:ietf:params:oauth:request_uri:...> and the
+#                       token is vaulted ONLY when the app then calls
+#                       CompleteResourceTokenAuth with it (see client/consent.py).
 #
-# Setting this to the provider callback re-enters that endpoint with no code/state and
-# fails: "2 validation errors detected: Value at 'authorizationCode' failed to satisfy
-# constraint: Member must not be null; Value at 'state' ...".
+# IT IS NOT A PASSIVE LANDING PAGE. Believing that cost a long debugging session: point
+# it at a third party (GitHub's authorized-apps page renders perfectly) and the
+# session_id is silently discarded — the vendor lists the app as authorized,
+# GetResourceOauth2Token keeps issuing fresh consent URLs, and sessionStatus stays
+# IN_PROGRESS forever. Every symptom reads "user never consented" when consent was in
+# fact given and never *completed*.
+#
+# Setting this to the provider callback instead re-enters that endpoint with no
+# code/state and fails: "2 validation errors detected: Value at 'authorizationCode'
+# failed to satisfy constraint: Member must not be null; Value at 'state' ...".
 #
 # Injected so it can differ per environment (a real web front end would use its own
 # "you're connected" page) and so it stays in sync with the WorkloadIdentity's
@@ -178,30 +243,122 @@ class NoWaitTokenPoller(TokenPoller):
 # here must not require touching invoke(), the response shape, or the client.
 #
 # To add a source:
-#   1. Create its OAuth2 credential provider (a resource in infra/02-runtime.yaml),
-#      and paste the callback URL it issues into that vendor's OAuth app. `Name` is
-#      createOnly, so a rename reissues the URL.
-#   2. Inject <KEY>_CREDENTIAL_PROVIDER and <KEY>_SCOPES as runtime env vars.
+#   1. Pick its `credential` kind (see below). DELEGATED_SUBJECT if the vendor can be
+#      reached by impersonating a user (no consent); VAULTED_OAUTH otherwise.
+#   2. For VAULTED_OAUTH: create its OAuth2 credential provider (a resource in
+#      infra/02-runtime.yaml), paste the callback URL it issues into that vendor's
+#      OAuth app (`Name` is createOnly, so a rename reissues the URL), and inject
+#      <KEY>_CREDENTIAL_PROVIDER and <KEY>_SCOPES.
+#      For DELEGATED_SUBJECT: inject whatever the impersonation needs (for Drive, a
+#      Secrets Manager ARN) and name that variable in `enabled_by`.
 #   3. Add a row below with the search callable, plus two optional ones: `fetch`
 #      (a document's full text, for read_company_document) and `inventory` (what this
 #      user can see, for list_available_sources). A source missing either is simply
 #      not offered to that tool — neither is required to make the source useful.
-#   4. Nothing else. Token brokering, per-source consent URLs, the response
+#   4. Nothing else. Credential brokering, per-source consent URLs, the response
 #      contract, and the client's output all iterate over this dict.
 #
 # A source is SKIPPED, not fatal, when its env vars are absent — so one template
 # can deploy a GitHub-only stack and a four-source stack without code changes.
+#
+# ---- TOKEN PATH (`flow`) --------------------------------------------------------
+# Per source, and resolved from CONFIG rather than hardcoded, which is requirement
+# FR-34: a source must be migratable between paths with no code change. Two values:
+#
+#   USER_FEDERATION              3-legged OAuth. The user consents ONCE per source,
+#                                and AgentCore Identity vaults a refresh token.
+#   ON_BEHALF_OF_TOKEN_EXCHANGE  RFC 8693 token exchange. NO consent screen ever:
+#                                the user's IdP JWT is exchanged for a token at the
+#                                resource. Requires the IdP and the RESOURCE to
+#                                support it (see the readiness note below).
+#
+# THE AGENT DOES NOT CARE WHICH. Both end at the identical guarantee — the API call
+# runs as the user, so native ACLs decide visibility. What differs is who consents
+# and who holds long-lived credentials. Keeping the choice in this table is what lets
+# `invoke()` stay one loop over `ENABLED`.
+#
+# ⚠️ OBO IS NOT UNIVERSALLY AVAILABLE, and the failure is not graceful — it is a hard
+# error from the vendor's token endpoint. Verified empirically: GitHub returns
+# `{"error": "unsupported_grant_type"}` for the token-exchange grant, so GitHub CANNOT
+# use OBO no matter how identity is arranged. Do not set `flow` to OBO for a source
+# without first confirming against that vendor's token endpoint that it accepts the
+# exchange.
+_FLOW_USER_FEDERATION = "USER_FEDERATION"
+_FLOW_OBO = "ON_BEHALF_OF_TOKEN_EXCHANGE"
+
+
+def _flow_for(key: str, default: str = _FLOW_USER_FEDERATION) -> str:
+    """Resolve a source's token path from `<KEY>_AUTH_FLOW`, defaulting to consent.
+
+    Defaults to USER_FEDERATION deliberately: it works against any OAuth2 provider,
+    whereas OBO silently requires vendor support. A wrong default that always works is
+    better than one that fails at the first question with `unsupported_grant_type`.
+    """
+    val = (os.environ.get(f"{key.upper()}_AUTH_FLOW") or "").strip().upper()
+    if not val:
+        return default
+    if val not in (_FLOW_USER_FEDERATION, _FLOW_OBO):
+        raise RuntimeError(
+            f"{key.upper()}_AUTH_FLOW must be {_FLOW_USER_FEDERATION} or "
+            f"{_FLOW_OBO}, got {val!r}"
+        )
+    return val
+
+
+# ---- CREDENTIAL KIND (`credential`) ---------------------------------------------
+# HOW a source's per-user credential is obtained. Orthogonal to `flow`, which only
+# describes the OAuth variant used by the vaulted path.
+#
+#   VAULTED_OAUTH   AgentCore Identity brokers a per-user token (consent or OBO) and
+#                   the search callable receives that TOKEN.
+#   DELEGATED_SUBJECT
+#                   No user token exists. The source impersonates the user by NAME,
+#                   so the callable receives the VERIFIED EMAIL instead. Google Drive
+#                   works this way, because Drive is guarded by Google and Okta cannot
+#                   mint a token Drive accepts (see gdrive_tool's module docstring).
+#
+# Both preserve the invariant that makes this system safe: the call to the source runs
+# as the user, so the SOURCE does the ACL trimming. What differs is what proves the
+# identity — a token the user granted, versus a claim we cryptographically verified.
+#
+# ⚠️ DELEGATED_SUBJECT REQUIRES VERIFIED CLAIMS. A delegated source can reach ANY user
+# in the domain, so its subject must come from identity_claims.verified_email() —
+# signature, issuer and audience checked. The unverified `_user_sub()` decode below is
+# fine for logging and MUST NEVER be used as a subject.
+_CRED_VAULTED = "VAULTED_OAUTH"
+_CRED_DELEGATED = "DELEGATED_SUBJECT"
+
 SOURCES: dict[str, dict] = {
     "github": {
+        "credential": _CRED_VAULTED,
         "provider": os.environ.get("GITHUB_CREDENTIAL_PROVIDER"),
         "scopes": (os.environ.get("GITHUB_SCOPES") or "").split(),
+        # GitHub does NOT support the token-exchange grant (tested: it returns
+        # unsupported_grant_type), so this stays on the consent path. The env var can
+        # still override it — for a future GitHub Enterprise / proxy that does.
+        "flow": _flow_for("github"),
         "search": search_github,
         "fetch": fetch_document,
         "inventory": list_sources,
         "label": "GitHub",
     },
+    # Google Drive / Docs. THE PRIMARY DEMO SOURCE: no consent screen ever appears,
+    # and the per-user trim is still enforced by Drive itself. Enabled by setting
+    # GOOGLE_SA_SECRET_ARN; absent, the row is skipped like any other.
+    "gdrive": {
+        "credential": _CRED_DELEGATED,
+        # No credential provider and no scopes: there is no vaulted OAuth token to
+        # broker. Google scopes are granted ONCE by a Workspace admin in the
+        # domain-wide delegation grant, not requested per user per call.
+        "provider": None,
+        "scopes": [],
+        "enabled_by": "GOOGLE_SA_SECRET_ARN",
+        "search": None,      # bound below, only if the dependency imports
+        "fetch": None,
+        "inventory": None,
+        "label": "Google Drive",
+    },
     # "confluence":      {... "search": search_confluence},   # Atlassian
-    # "gdrive":          {... "search": search_gdrive},
     # "slack":           {... "search": search_slack},         # source, not the front door
     # "databricks_genie":{... "search": search_genie},         # MCP-native
     #
@@ -212,14 +369,46 @@ SOURCES: dict[str, dict] = {
     # filtering, no matter how the tools are routed.
 }
 
+# Bind the Drive callables only if the source is switched on AND its dependencies are
+# present. The google-api-python-client import is deliberately guarded: an image built
+# before those packages were added to requirements.txt must still serve GitHub rather
+# than crash-loop on an ImportError at module scope. A configured-but-unimportable
+# source is a loud startup message, not a dead runtime.
+if SOURCES["gdrive"]["enabled_by"] and os.environ.get(SOURCES["gdrive"]["enabled_by"]):
+    try:
+        from gdrive_tool import (fetch_drive_document, list_drive_sources,
+                                 search_drive)
+        SOURCES["gdrive"].update({"search": search_drive,
+                                  "fetch": fetch_drive_document,
+                                  "inventory": list_drive_sources})
+    except ImportError as e:
+        print(f"WARNING: GOOGLE_SA_SECRET_ARN is set but the Google client libraries "
+              f"are missing ({e}); the Drive source is DISABLED. Rebuild the image "
+              f"with requirements.txt current.", flush=True)
+
+
+def _is_enabled(src: dict) -> bool:
+    """Whether a source is configured on this runtime.
+
+    Two different tests, because the two credential kinds need different things:
+    a vaulted source needs a credential provider and scopes; a delegated source needs
+    its enabling env var and a bound search callable (the latter fails if the client
+    libraries are absent, per the guarded import above).
+    """
+    if src.get("credential") == _CRED_DELEGATED:
+        return bool(os.environ.get(src.get("enabled_by") or "") and src.get("search"))
+    return bool(src.get("provider") and src.get("scopes"))
+
+
 # Sources actually configured on this runtime. Enforced non-empty: an agent with no
 # search source cannot answer anything under STRICT GROUNDING, so failing at import
 # is better than serving confident-looking LOW-confidence answers forever.
-ENABLED = {k: v for k, v in SOURCES.items() if v["provider"] and v["scopes"]}
+ENABLED = {k: v for k, v in SOURCES.items() if _is_enabled(v)}
 if not ENABLED:
     raise RuntimeError(
         "no data source is configured: set <SOURCE>_CREDENTIAL_PROVIDER and "
-        "<SOURCE>_SCOPES for at least one of " + ", ".join(SOURCES)
+        "<SOURCE>_SCOPES, or a delegated source's enabling variable "
+        "(e.g. GOOGLE_SA_SECRET_ARN), for at least one of " + ", ".join(SOURCES)
     )
 
 # PROVISIONED BUT UNUSED — the switch from stateless to stateful.
@@ -251,8 +440,10 @@ TOOLS — pick by what the question is about:
 - read_company_document: the full text of one hit. Search returns only the matching
   fragments, so READ THE PROMISING HITS before saying information is missing — a
   fragment is a pointer, not the document. Pass a result's "ref" verbatim.
-- list_available_sources: what the user can access or owns (repositories, spaces,
-  drives). Content search cannot answer inventory questions, so do not substitute it.
+- list_available_sources: what the user can access or owns (repositories, shared
+  drives, documents, spaces). Content search cannot answer inventory questions, so do
+  not substitute it. Each item carries a "kind" — describe items using their own kind
+  rather than calling everything a repository or a file.
 
 Typical shape of a good answer: search, read the two or three most promising hits,
 then answer from their text.
@@ -266,7 +457,10 @@ STRICT GROUNDING:
 - Each result carries a "source" field. When results come from more than one source,
   make clear which source each cited claim came from.
 - If a document comes back with "truncated": true, you read a prefix — do not conclude
-  it fails to mention something.
+  it fails to mention something. A result may also carry a "note" explaining a limit of
+  what could be extracted (a spreadsheet's first sheet only, a format whose text could
+  not be read); respect it the same way and say so rather than treating silence as
+  absence.
 - If nothing relevant is returned, say so plainly. If a result carries an "error"
   field, that source could not be searched — say which one, and do not imply its
   content was checked and found empty. Never invent facts.
@@ -286,9 +480,55 @@ Sources:
 Confidence: HIGH | MEDIUM | LOW — <one short reason>"""
 
 
+def _caller_jwt(context) -> str:
+    """The caller's JWT, taken from the HEADER the authorizer validated.
+
+    THE ONLY PLACE THE USER'S TOKEN ENTERS THE AGENT, and it must stay that way. The
+    request body carries the QUESTION; the header carries WHO IS ASKING. Accepting an
+    identity from the body as well would mean the value the CUSTOM_JWT authorizer
+    authenticated and the value that selects whose Drive is read are two different
+    strings with nothing forcing them to match — a caller could pair a valid token for
+    themselves in the header with a valid token for a colleague in the body, and both
+    would verify while the impersonation followed the body. Reading only the header
+    makes that divergence unrepresentable instead of something to check for.
+
+    HOW THE HEADER GETS HERE. The runtime SDK gives `Authorization` its own branch when
+    it builds the request context (bedrock_agentcore/runtime/app.py), exempt from the
+    RESTRICTED_HEADERS allowlist that blocks Proxy-Authorization, Cookie and the
+    X-Forwarded-* family, and normalises the key to canonical casing regardless of what
+    the wire used. `context.request_headers["Authorization"]` is a supported read.
+
+    FAILS CLOSED, DELIBERATELY. `request_headers` is None when no forwardable header
+    arrived, so the `or {}` matters: an absent header yields "" and lets
+    verified_claims() refuse, rather than producing a default subject. "" is not
+    itself an error — a SigV4-authenticated caller legitimately has no user JWT here
+    (the SDK expects X-Amzn-Bedrock-AgentCore-Runtime-User-Id instead) and simply finds
+    every delegated source unavailable for the turn.
+
+    THIS DOES NOT REPLACE VERIFICATION. The header proves only that the platform let the
+    request through. identity_claims.verified_email() still checks signature, issuer,
+    audience, `email_verified` and the domain allowlist — two of those five are things
+    no authorizer checks (see identity_claims.py).
+    """
+    headers = getattr(context, "request_headers", None) or {}
+    raw = headers.get("Authorization") or ""
+    # Case-insensitive scheme, and tolerate the token being sent bare. Anything that is
+    # not a Bearer credential is not one we can use.
+    parts = raw.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return raw.strip() if len(parts) == 1 else ""
+
+
 def _user_sub(access_token: str) -> str:
-    """Extract the stable user id from the inbound Auth0 JWT (unverified decode;
-    signature is validated at the gateway/authorizer boundary)."""
+    """The stable user id, for LOGGING AND LABELLING ONLY — unverified decode.
+
+    Never an authorization input. `verify_signature: False` means an expired or
+    malformed token still yields a plausible-looking `sub`, which is fine for a log line
+    and wrong for a decision. verified_email() is the only source of an impersonation
+    subject. The input is the authenticated header rather than anything the caller can
+    set independently, which is what keeps an unverified decode acceptable at all here.
+    """
     try:
         claims = jwt.decode(access_token, options={"verify_signature": False})
         return claims.get("sub") or claims.get("email") or "anonymous"
@@ -297,8 +537,18 @@ def _user_sub(access_token: str) -> str:
 
 
 def _build_agent(tokens: dict[str, str]) -> Agent:
-    """Build the turn's agent. `tokens` maps source key -> that user's access token
-    (absent or empty = not connected, so that source is not searched)."""
+    """Build the turn's agent.
+
+    `tokens` maps source key -> that source's PER-USER CREDENTIAL, which is one of two
+    things depending on the source's `credential` kind:
+      VAULTED_OAUTH      an OAuth access token belonging to this user
+      DELEGATED_SUBJECT  this user's VERIFIED email, which the source impersonates
+    Absent or empty means unavailable, so that source is not searched.
+
+    The tools below do not branch on which kind it is — each source's callables know
+    what they receive. That is why a delegated source needs no change to any tool, and
+    why `tokens` is passed straight through rather than interpreted here.
+    """
 
     @tool
     def search_company_documents(query: str) -> str:
@@ -378,9 +628,9 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
         ("which repositories can I see?", "list my projects") — questions about
         inventory rather than document content, which search cannot answer.
 
-        `owned_by_user` marks items this user owns. GitHub does not expose who
-        created a repository, so report ownership as ownership; do not claim
-        authorship.
+        `owned_by_user` marks items this user owns, and `kind` says what each item is
+        (repository, shared drive, google doc, ...). Neither GitHub nor Drive exposes
+        who CREATED an item, so report ownership as ownership; do not claim authorship.
         """
         items: list = []
         for key, src in ENABLED.items():
@@ -408,9 +658,18 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
 async def invoke(payload, context):
     """AgentCore Runtime entrypoint — STATELESS. One invocation, one answer.
 
-    payload: {"prompt": "...", "access_token": "<auth0 user JWT>"}
-      (In production the ingress gateway passes the JWT through; access_token in
-       the payload lets the CLI client drive the same path directly.)
+    payload: {"prompt": "..."}
+    identity: the caller's JWT, read from the `Authorization` header via `context` —
+      never from the payload. The body carries the QUESTION; the header carries WHO IS
+      ASKING, and only one of those is authenticated. See `_caller_jwt()`.
+
+    DO NOT RENAME THE `context` PARAMETER. The SDK decides whether to pass the request
+    context by inspecting this signature for a second parameter literally named
+    "context" (`_takes_context` in bedrock_agentcore/runtime/app.py). Any other name and
+    the handler is called with the payload alone — so the failure mode of a rename is a
+    TypeError on a missing argument if you are lucky, and every delegated source
+    silently unavailable if the parameter has a default. Neither says "you renamed the
+    thing that carries the user's identity".
 
     WHAT "STATELESS" MEANS HERE
     Everything this function needs arrives in `payload`. It reads no prior turn,
@@ -463,20 +722,104 @@ async def invoke(payload, context):
     ------------------------------------------------------------------------
     """
     prompt = payload.get("prompt", "").strip()
-    user_jwt = payload.get("access_token", "")
+    # From the HEADER, not the payload. This one line is the identity binding: the value
+    # that names the user is the same value the authorizer authenticated.
+    user_jwt = _caller_jwt(context)
     if not prompt:
         return {"error": "empty prompt"}
 
     user_sub = _user_sub(user_jwt)
 
-    # Per-user token PER SOURCE, brokered by AgentCore Identity via 3-legged OAuth
-    # consent (vaulted + refreshed). Sources are independent: a user connected to
-    # GitHub but not Confluence gets GitHub results, not an error.
+    # Per-user token PER SOURCE, brokered by AgentCore Identity. Each source's `flow`
+    # decides HOW (consent vs token exchange); this loop is identical either way.
+    # Sources are independent: a user connected to GitHub but not Confluence gets
+    # GitHub results, not an error.
+    #
+    # ---- HOW THE USER'S IDENTITY REACHES THE EXCHANGE (the OBO question) ----------
+    # Nothing here passes `user_jwt` to Identity explicitly, and that is correct — it
+    # would be the wrong design, because a token the agent chooses is a token the agent
+    # could forge. The propagation is ambient and platform-enforced:
+    #
+    #   1. The caller presents the user's IdP JWT as `Authorization: Bearer`.
+    #   2. The runtime's CUSTOM_JWT authorizer VALIDATES it (signature, iss, aud) via
+    #      JWKS. An invalid token never reaches this container at all.
+    #   3. The platform then injects a `WorkloadAccessToken` request header, which the
+    #      SDK stores in a contextvar (runtime/app.py `_build_request_context`).
+    #   4. `@requires_access_token` reads that contextvar and sends it as
+    #      `workloadIdentityToken` on GetResourceOauth2Token.
+    #
+    # So the user identity Identity acts on is the one the AUTHORIZER verified, not one
+    # this code asserts. That is exactly the property you want from OBO: the agent
+    # cannot request a token for a user it cannot prove. `user_jwt` below is used only
+    # to read `sub` for logging/partitioning — never as a credential.
+    #
+    # THE DELEGATED PATH SHARES THAT PROPERTY BY A DIFFERENT ROUTE. `user_jwt` comes from
+    # the `Authorization` header (see `_caller_jwt`) — the same string the authorizer
+    # validated. So the vaulted path derives the user from the WorkloadAccessToken
+    # contextvar and the delegated path from the header, and neither reads anything a
+    # caller can vary independently of what was authenticated.
+    #
+    # CONSEQUENCE FOR A SLACK FRONT END: the receiver must forward a real per-user IdP
+    # JWT. A bot/service token would make every user share one identity and silently
+    # collapse the permission trim, and SIGV4 inbound auth requires the
+    # X-Amzn-Bedrock-AgentCore-Runtime-User-Id header instead (see the SDK's error text
+    # in identity/auth.py `_get_workload_access_token`).
     tokens: dict[str, str] = {}
     auth_urls: dict[str, str] = {}
     errors: dict[str, str] = {}   # source key -> why its token could not be obtained
 
+    # DELEGATED sources first: no Identity round trip, no consent, nothing to vault.
+    # The "credential" is the user's own verified email, and the source impersonates
+    # them by name. This is the path that delivers the desired outcome — zero user
+    # interaction with a per-user ACL trim still enforced by the source.
+    #
+    # VERIFICATION IS MANDATORY HERE even though the token arrives on the authenticated
+    # header, because two of the five gates in verified_email() are things NO authorizer
+    # checks: `email_verified` must be TRUE (an issuer permitting self-signup will
+    # genuinely sign a token whose `email` is a colleague's address), and the domain must
+    # sit inside the allowlist the delegation grant actually covers. Signature/iss/aud are
+    # re-checked too — "it reached this container, therefore it was validated" is an
+    # undocumented platform invariant, and confirming it costs one cached JWKS lookup per
+    # ten minutes.
+    #
+    # WHY THE SUBJECT COMES FROM THE HEADER AND NOWHERE ELSE. Taking it from the request
+    # body instead would let a caller pair a valid header for themselves with a body token
+    # naming someone else: the authorizer checks one string, the impersonation follows the
+    # other, and both verify. There is no body field here to disagree with the header.
+    # `_user_sub()` decodes without checking the signature, which is acceptable for a log
+    # field and would not be for a subject.
+    delegated_subject: str | None = None
+    if any(s.get("credential") == _CRED_DELEGATED for s in ENABLED.values()):
+        try:
+            delegated_subject = verified_email(user_jwt)
+        except ClaimVerificationError as e:
+            # Every delegated source is unavailable this turn. Deliberately NOT
+            # degraded to an unverified fallback: answering from the wrong user's
+            # documents is far worse than not answering.
+            # GENERIC message to the caller; the REASON goes only to the log.
+            # identity_claims' errors quote token internals — the expected `iss`, the
+            # expected `aud`, which `kid` values the JWKS carries. Returning those
+            # verbatim (which this did) hands an unprivileged caller a tuning oracle
+            # for forging the very claim that selects whose Drive is read. The
+            # operator gets the detail from CloudWatch; the caller gets "no".
+            for key, src in ENABLED.items():
+                if src.get("credential") == _CRED_DELEGATED:
+                    errors[key] = (
+                        "cannot verify the caller's identity, so no user can be "
+                        "impersonated. See the runtime logs for the reason.")
+            print(f"ERROR: claim verification failed; delegated sources disabled "
+                  f"for this turn: {e}", flush=True)
+
     for key, src in ENABLED.items():
+        if src.get("credential") == _CRED_DELEGATED:
+            if delegated_subject:
+                # The subject IS the credential for this source kind. Stored in the
+                # same dict so _build_agent's tools stay one uniform loop.
+                tokens[key] = delegated_subject
+            continue
+
+        flow = src.get("flow") or _FLOW_USER_FEDERATION
+
         # USER_FEDERATION is a 3-legged flow: the FIRST time a given user asks,
         # there is no vaulted token yet and AgentCore Identity produces a consent
         # URL that this user must visit once. Capturing it is not optional — the SDK
@@ -484,13 +827,33 @@ async def invoke(payload, context):
         # URL is discarded and the user can never connect. Every answer then comes
         # back LOW confidence with no sources, which looks like a broken agent
         # rather than a missing consent.
-        def _capture(url: str, _k: str = key) -> None:
+        #
+        # On the OBO path this callback should NEVER fire. If it does, the exchange
+        # silently degraded to interactive consent — which defeats the entire point of
+        # choosing OBO — so it is recorded as an ERROR rather than shown to the user.
+        # FR-5a: an OBO failure is a POLICY failure, not a consent gap, and must never
+        # be handled by prompting a user to consent to something they cannot
+        # self-grant.
+        def _capture(url: str, _k: str = key, _flow: str = flow) -> None:
+            if _flow == _FLOW_OBO:
+                errors[_k] = (
+                    "OBO/token-exchange unexpectedly returned an interactive consent "
+                    "URL, which means the exchange did not succeed. Treating as a "
+                    "policy failure, not a consent prompt (FR-5a). Check that this "
+                    "resource accepts the RFC 8693 grant and that the user's IdP "
+                    "token has the required scopes."
+                )
+                print(f"ERROR: source '{_k}' is configured for {_FLOW_OBO} but the "
+                      f"service returned a consent URL; not surfacing it to the user.",
+                      flush=True)
+                return
             auth_urls[_k] = url          # _k default-binds the loop variable
 
         @requires_access_token(
             provider_name=src["provider"],
             scopes=src["scopes"],
-            auth_flow="USER_FEDERATION",
+            # Per-source, from config — NOT hardcoded. See `_flow_for` and FR-34.
+            auth_flow=flow,
             into="access_token",
             on_auth_url=_capture,
             # Where the vendor redirects after the user approves consent. The SDK
@@ -579,6 +942,22 @@ async def invoke(payload, context):
     unavailable = {k: e for k, e in errors.items() if not tokens.get(k) and k not in pending}
     if unavailable:
         result["source_errors"] = unavailable
+
+    # Which token path each source used, so a caller can tell "the user must click
+    # something" apart from "an admin must fix a grant" WITHOUT parsing error strings.
+    # An OBO source can never appear in `auth_required` (see `_capture`), so a Slack
+    # front end can show a consent button for USER_FEDERATION sources and route OBO
+    # failures to an operator instead of prompting a user who cannot self-grant.
+    #
+    # A DELEGATED source reports its credential kind rather than an OAuth flow, because
+    # calling it USER_FEDERATION would be a lie that matters: a client would render a
+    # "connect your account" button for a source that never needs one. It can never
+    # appear in `auth_required` either — there is no consent URL in that path at all.
+    result["source_flows"] = {
+        k: (_CRED_DELEGATED if v.get("credential") == _CRED_DELEGATED
+            else (v.get("flow") or _FLOW_USER_FEDERATION))
+        for k, v in ENABLED.items()
+    }
     return result
 
 

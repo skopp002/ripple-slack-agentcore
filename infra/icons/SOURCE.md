@@ -1,12 +1,19 @@
 # Icon provenance
 
-The PNGs in this directory come from three official sources, one per family:
+> **Where this sits in the architecture diagram
+> (`../architecture-components.png`):** these are the tile glyphs, one per node in
+> `render_components.py`'s `NODES`. Nothing here runs; it is the diagram's artwork. A
+> missing file is caught by the renderer's `missing_art` check rather than silently
+> drawn as a blank box, so adding a node means adding its icon here in the same change.
+
+The PNGs in this directory come from four official sources, one per family:
 
 | Family | Source |
 |---|---|
 | AgentCore (Runtime, Gateway, Identity, Memory, Observability) | `Agentcore-Bedrock-Icons.pptx`, AWS-provided deck |
 | AWS services (Bedrock, S3, CodeBuild, ECR, Secrets Manager, CloudWatch) + Client/User | [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/) package |
-| Slack, GitHub, Auth0, Okta | each vendor's own brand mark |
+| Slack, GitHub, Auth0, Okta, MCP | each vendor's own brand mark |
+| Google Drive, Google Docs, Google Cloud IAM | Google's own product-mark and Cloud icon endpoints |
 
 Everything is vendored here on purpose: `render_components.py` must not depend on
 a file in someone's `~/Downloads`, and the render has to work on a fresh clone.
@@ -86,18 +93,135 @@ collection of full-colour vendor marks, rasterised the same way:
 | `slack.png` | `logos/slack-icon.svg` | Slack's four-petal mark |
 | `github.png` | `logos/github-icon.svg` | Octocat mark |
 | `auth0.png` | `logos/auth0-icon.svg` | square logomark, not the wordmark |
-| `okta.png` | `logos/okta-icon.svg` | **unused in this diagram** — see below |
+| `okta.png` | `logos/okta-icon.svg` | radial "aura" logomark, not the `okta` wordmark |
 
 The `-icon` suffix matters: the un-suffixed files are wide wordmarks that squash
 badly on a square tile.
 
-### Auth0, not Okta
+`okta.png` was re-checked against Okta's own current assets: the wordmark at
+<https://www.okta.com/sites/default/files/Okta_Logo_BrightBlue_Medium.png> and the
+logomark in <https://www.okta.com/favicon.ico>. The favicon carries the same
+radial mark as the vendored file (mean alpha delta 0.36/255 after normalising),
+so `okta.png` is the **current** Okta logomark, not a retired one. It is the
+logomark rather than the lowercase `okta` wordmark — correct for a square tile.
 
-The diagram shows the **Auth0** mark because Auth0 is the tenant this solution
-actually authenticates against (`dev.env.example`, `AUTH0_DOMAIN`). Okta appears
-only in `aiplc-docs/discovery/requirements/addendum-okta-federated-and-memory.md`,
-which describes a target-state Cross-App Access design that is a different
-diagram. `okta.png` is vendored ready for that one.
+### Auth0, and Okta
+
+The diagram has historically shown the **Auth0** mark because Auth0 is the tenant
+this solution actually authenticates against (`dev.env.example`, `AUTH0_DOMAIN`).
+Okta is the identity provider in the Cross-App Access design
+([`../ARCHITECTURE.md`](../ARCHITECTURE.md)); `okta.png` is vendored for that one. Both
+files stay, so whichever identity provider a given revision of the diagram
+depicts, the correct mark is on hand.
+
+### MCP — straight from the spec repo, not gilbarbara
+
+`mcp.png` is the Model Context Protocol mark. gilbarbara does carry a
+`model-context-protocol-icon.svg` and it renders identically (mean alpha delta
+1.22/255), but the mark was taken from the protocol's own repository instead so
+the provenance is first-party:
+
+```bash
+curl -sLO https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/docs/logo/light.svg
+rsvg-convert -h 1600 -a light.svg -o mcp-h1600.png   # 1338x195 lockup: glyph + "Model Context Protocol"
+```
+
+`docs/logo/light.svg` is a horizontal *lockup*, so the wordmark has to come off.
+The glyph occupies the left ~13% of the 1338-unit viewBox, and there is a clear
+run of empty columns between glyph and text (viewBox x 174.3 → 223.7), so the
+crop is unambiguous rather than eyeballed: crop to x < 1430 px at `-h 1600`, take
+the alpha bounding box, then scale to height 384. Identical geometry appears in
+`docs/favicon.svg` (a 180x180 square with the glyph knocked out of a black
+rounded rect) — that version was **not** used, because the black plate fights the
+light tile `render_components.py` puts behind line art.
+
+| File here | Source | Note |
+|---|---|---|
+| `mcp.png` | `modelcontextprotocol/modelcontextprotocol` → `docs/logo/light.svg` | glyph only, wordmark cropped off |
+
+## Family 4 — Google product marks and Cloud icons
+
+Google splits its icons across two unrelated endpoints, and picking the wrong one
+silently yields a **retired** logo, so both are pinned here explicitly.
+
+### Workspace product marks (Drive, Docs)
+
+Google publishes the Workspace product marks as PNG on `gstatic.com`. There are
+two generations at the same path, and the difference matters:
+
+| Path | Generation |
+|---|---|
+| `product/1x/drive_512dp.png` | **pre-2020**, drop-shadowed — do not use |
+| `product/1x/drive_2020q4_512dp.png` | current flat 2020 Q4 refresh — use this |
+
+The `_2020q4_` infix is the whole trick. Verified by rendering both: the
+un-infixed Drive file is the old triangle with a shadow and no red facet; the
+`2020q4` file is the current four-colour Drive triangle.
+
+```bash
+B=https://www.gstatic.com/images/branding/product/1x
+curl -sLO $B/drive_2020q4_512dp.png
+curl -sLO $B/docs_2020q4_512dp.png
+```
+
+These arrive as 512x512 PNGs with the mark letterboxed inside a transparent
+canvas, so they are cropped to the alpha bounding box before scaling to height
+384 — otherwise the mark renders visibly smaller than every other tile:
+
+```python
+im = Image.open(src).convert("RGBA")
+im = im.crop(im.split()[3].getbbox())
+im.resize((round(im.width * 384 / im.height), 384), Image.LANCZOS).save(dst)
+```
+
+`docs_2020q4_512dp.png` ships as 8-bit palette + `transparency`; the `.convert(
+"RGBA")` above normalises it so it matches the other RGBA tiles.
+
+| File here | Source URL |
+|---|---|
+| `google-drive.png` | `https://www.gstatic.com/images/branding/product/1x/drive_2020q4_512dp.png` |
+| `google-docs.png` | `https://www.gstatic.com/images/branding/product/1x/docs_2020q4_512dp.png` |
+
+Drive and Docs are kept as **two** files rather than collapsing both into one
+"Google Workspace" tile. There is no square Workspace mark to collapse them into:
+`gstatic` serves no `workspace_*dp.png` or `gsuite_*dp.png` (both 404), and
+gilbarbara's `google-workspace.svg` is a 512x66 wordmark that would squash to
+nothing on a 0.74in tile. The only square alternative is the plain Google "G",
+which asserts *Google*, not *Drive* — the wrong claim under the rule at the top
+of this file.
+
+### Google Cloud IAM
+
+From Google's own Cloud icon set, linked off <https://cloud.google.com/icons>:
+
+```bash
+curl -sLO https://services.google.com/fh/files/misc/google-cloud-legacy-icons.zip
+unzip -o -q google-cloud-legacy-icons.zip 'identity_and_access_management/*'
+rsvg-convert -h 384 -a identity_and_access_management/identity_and_access_management.svg \
+  -o google-cloud-iam.png
+```
+
+| File here | Source SVG in the package | SVG `<title>` |
+|---|---|---|
+| `google-cloud-iam.png` | `identity_and_access_management/identity_and_access_management.svg` | `Icon_24px_IAM_Color` |
+
+### No "Service Account" icon exists
+
+The domain-wide-delegation credential is a *service account*, and Google ships
+**no service-account icon**. All three packages on <https://cloud.google.com/icons>
+were unzipped and searched (`core-products-icons.zip` 89 entries,
+`category-icons.zip` 130, `google-cloud-legacy-icons.zip` 432); zero entries match
+`service.?account` in any of the three. The nearest candidates were rejected:
+
+| Rejected | Why |
+|---|---|
+| `permissions/permissions.svg` | a generic person bust — asserts a *user*, and the whole point of a service account is that it is not one |
+| `workload_identity_pool/…` | Workload Identity Federation is the *keyless* alternative to a service-account key; using it here would assert the opposite architecture |
+| `secret_manager/…` | that is Google's Secret Manager product; this solution holds the credential in **AWS** Secrets Manager (`secrets-manager.png`) |
+
+So `google-cloud-iam.png` is the honest choice: IAM is the service that actually
+issues and governs the service account, and the icon is Google's own IAM mark.
+It does not claim to be a "service account" icon, because none exists.
 
 These marks are the vendors' trademarks, used here to identify their products in
 an internal architecture diagram. That is nominative use; it is not an endorsement.

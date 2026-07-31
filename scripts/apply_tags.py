@@ -20,6 +20,30 @@ Resource discovery is by name/ARN derived from config, never by wildcard: this
 AWS account is shared with unrelated AgentCore samples, and a broad sweep would
 misattribute their cost to Ripple.
 
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png): it has
+no tile and performs no numbered step in either flow. It runs once after a deploy and
+touches cost tags only — no resource it visits behaves differently afterwards, and every
+numbered step runs identically whether it succeeded, was skipped, or reported failures.
+
+It does, however, sweep across most of the canvas, which is why the list below reads as
+a tour: the AgentCore Runtime and its endpoint, AgentCore Memory, the credential
+provider that backs the token vault tile for the consent flow, the three build-plane
+tiles (S3 is only printed, not tagged — 01-foundation.yaml declares and tags the bucket
+itself), the CodeBuild role, and the log groups behind the CloudWatch / AgentCore
+Observability tile. That tile is drawn outside the AgentCore box on purpose, and this
+script is where that separation shows up as work: the RUNTIME log group is the one
+thing on the diagram no template can declare, because its name embeds the runtime id
+CloudFormation generates and the service does not create it until the first invoke.
+
+The Secrets Manager tile appears here only under ClientSecretSource=MANAGED, where
+AgentCore Identity owns the secret holding the GitHub client secret and may refuse
+caller tagging. Passing GithubClientSecretArn avoids that tile being service-owned at
+all, which is the recommended path in 02-runtime.yaml.
+
+Discovery is by derived name, never by wildcard, and that is an architecture
+constraint rather than a style choice: this account holds unrelated AgentCore samples,
+so a broad sweep would tag tiles that are not on this diagram.
+
 Usage:
     source dev.env
     python3 scripts/apply_tags.py [--dry-run]

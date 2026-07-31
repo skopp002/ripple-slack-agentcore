@@ -30,6 +30,28 @@ magic.
 NOT deprecated and still used: the `bedrock-agentcore` SDK, which the agent
 imports at runtime (BedrockAgentCoreApp, @requires_access_token). Different
 package from the starter toolkit; see requirements.txt.
+
+WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+nowhere on it, deliberately — this script has no tile and performs no numbered step.
+It creates the diagram by running the two templates that declare it: the build plane
+zone (S3, CodeBuild, ECR) from 01-foundation.yaml, then the AgentCore tiles (Runtime,
+Memory, the GitHub credential provider behind the token vault, and the execution
+role) from 02-runtime.yaml, threading the image tag cfn_build.py produced between
+them. Nothing here is on the request path; run it and then never again until the code
+changes, and every numbered step still runs without it.
+
+Two of its responsibilities are visible on the canvas even so. The GithubCallbackUrl
+it prints belongs to the "GitHub OAuth App" tile in the top-right consent zone — that
+URL is what makes the ★ human action land somewhere real, and it is reissued whenever
+the credential provider is replaced, so a stale one breaks consent with no error at
+deploy time. And ConsentReturnUrl, imported from the client rather than duplicated
+here, is the return leg of step 8b: pass a value that our own code does not serve and
+the vendor still shows the app as authorized while nothing is ever vaulted.
+
+The Google and GitHub credentials it threads through are ARNs only. The Secrets
+Manager tile holds the values; this script never sees them, which is why
+GOOGLE_SA_SECRET_ARN being empty is the switch that removes the entire Google Drive
+row (steps 8a-10a) from what the deployed system can do.
 """
 import argparse
 import os
@@ -268,10 +290,35 @@ def main() -> int:
     model_id = require_env("BEDROCK_MODEL_ID")
     github_client_id = require_env("GITHUB_CLIENT_ID")
     github_scopes = require_env("GITHUB_SCOPES")
+    # Optional: the template defaults to USER_FEDERATION. Passed explicitly when set,
+    # because `aws cloudformation deploy` reuses the STORED value for any parameter
+    # absent from --parameter-overrides — the same trap that once shipped a stale
+    # consent URL.
+    github_auth_flow = optional_env("GITHUB_AUTH_FLOW") or ""
     # Preferred path: the client secret lives in Secrets Manager and only its ARN
     # is passed, so the secret never enters the template or CloudFormation
     # history. See infra/README.md § "The GitHub client secret".
     secret_arn = optional_env("GITHUB_CLIENT_SECRET_ARN") or ""
+    # Setting this enables the Google Drive source (the no-consent path). Passed
+    # explicitly and ALWAYS — including when empty — because `aws cloudformation
+    # deploy` reuses the stored value for any parameter absent from
+    # --parameter-overrides. Omitting it when empty would make an
+    # already-Drive-enabled stack keep its old ARN, so "unset the var to turn Drive
+    # off" would silently not work.
+    google_sa_arn = optional_env("GOOGLE_SA_SECRET_ARN") or ""
+    # Bounds WHO can be impersonated. Required whenever Drive is on — the template
+    # asserts it too (Rules: DriveRequiresDomainAllowlist), but failing here is
+    # kinder: no image build, no changeset, and the message can name the env var.
+    allowed_domains = optional_env("ALLOWED_EMAIL_DOMAINS") or ""
+    if google_sa_arn and not allowed_domains:
+        print("\nERROR: GOOGLE_SA_SECRET_ARN is set (Drive enabled) but "
+              "ALLOWED_EMAIL_DOMAINS is not.\n"
+              "  The Drive source impersonates users by email. With no allowlist the "
+              "acceptable\n  subjects are every address your IdP will sign for, not "
+              "just your Workspace users.\n"
+              "  Set it in dev.env, e.g.  ALLOWED_EMAIL_DOMAINS=yourdomain.com",
+              file=sys.stderr)
+        return 2
 
     print(f"Region {REGION} · agent '{AGENT_NAME}' · "
           f"stacks '{FOUNDATION_STACK}' + '{RUNTIME_STACK}'")
@@ -304,7 +351,25 @@ def main() -> int:
         "GithubClientId": github_client_id,
         "GithubScopes": github_scopes,
         "ConsentReturnUrl": CONSENT_RETURN_URL,
+        # Empty string is meaningful (= Drive disabled), so this is never conditional.
+        "GoogleSaSecretArn": google_sa_arn,
+        # Always passed for the same reason as GoogleSaSecretArn: `deploy` reuses the
+        # STORED value for any omitted parameter, so narrowing the allowlist by
+        # unsetting the var has to actually narrow it.
+        "AllowedEmailDomains": allowed_domains,
     }
+    trust_unverified = (optional_env("TRUST_UNVERIFIED_EMAIL_CLAIM") or "").lower()
+    if trust_unverified in ("1", "true", "yes"):
+        # Loud, because it re-opens the hole the allowlist only partly covers: an
+        # absent `email_verified` becomes acceptable, so a self-registered address in
+        # an allowed domain is an impersonation subject.
+        print("\n  WARNING: TRUST_UNVERIFIED_EMAIL_CLAIM is on. Tokens with NO "
+              "`email_verified` claim\n  will be accepted as impersonation subjects. "
+              "Only valid if your IdP cannot emit\n  the claim AND self-signup is "
+              "impossible.")
+        runtime_params["TrustUnverifiedEmailClaim"] = "true"
+    if github_auth_flow:
+        runtime_params["GithubAuthFlow"] = github_auth_flow
     if secret_arn:
         runtime_params["GithubClientSecretArn"] = secret_arn
     deploy_stack(RUNTIME_STACK, "02-runtime.yaml", runtime_params, args.dry_run)

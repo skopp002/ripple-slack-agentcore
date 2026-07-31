@@ -1,5 +1,17 @@
 # Runtime dependencies for the agent CONTAINER only.
 #
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# This file decides which of the drawn edges the `RT` (AgentCore Runtime) tile can
+# actually walk. It is not itself a component, but omissions here disable flows
+# silently rather than loudly: google-auth + google-api-python-client are what make
+# steps 8a/9a/10a (the OBO flow's service-account assertion, Google's token endpoint,
+# and Drive) reachable at all, and pyjwt + cryptography are what make step 6a's
+# signature re-verification possible. An image built without the Google libraries
+# degrades to GitHub-only with a startup warning (agent/agent.py guards the import)
+# instead of crash-looping — which is the right failure, but it means "Drive is off"
+# can mean either "not configured" or "not installed". Both are in this file's blast
+# radius.
+#
 # bedrock-agentcore is the SDK (BedrockAgentCoreApp, @requires_access_token) —
 # what agent/ actually imports. It is a SEPARATE package from, and does not
 # depend on, bedrock-agentcore-starter-toolkit (the deploy tool being deprecated).
@@ -18,3 +30,10 @@ strands-agents-tools==0.5.2
 boto3>=1.40
 PyJWT[crypto]==2.10.1
 requests==2.32.3
+# Google Drive / Docs source (agent/gdrive_tool.py). Present in every image even when
+# the source is disabled: GOOGLE_SA_SECRET_ARN decides at RUNTIME whether the row is
+# enabled, so making the dependency conditional would mean two image variants and a
+# deploy that can enable a source the image cannot serve. agent.py guards the import
+# anyway, so an older image degrades to GitHub-only rather than crash-looping.
+google-auth==2.42.1
+google-api-python-client==2.189.0

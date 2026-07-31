@@ -6,16 +6,27 @@ which is slated for deprecation and no longer used anywhere in this repo.
 Every resource carries the cost allocation tag
 `project_name=ripple_slack_assistant` **natively at creation** — no retrofit pass.
 
-> **Architecture diagrams:** see [`ARCHITECTURE.md`](ARCHITECTURE.md) — three views.
+> **Architecture diagrams:** see [`ARCHITECTURE.md`](ARCHITECTURE.md) — four views.
 >
 > | PNG | What it shows | Regenerate |
 > |---|---|---|
-> | [`architecture-components.png`](architecture-components.png) | the components and trust boundaries, in official AWS icons — comparable side by side with the customer's own current-state diagram | `python3 infra/render_components.py` |
-> | [`architecture-a-deploy.png`](architecture-a-deploy.png) | deploy-time flow, every edge numbered | `python3 infra/render_diagrams.py` |
-> | [`architecture-b-request.png`](architecture-b-request.png) | request-time flow, every edge numbered | `python3 infra/render_diagrams.py` |
+> | [`architecture-components.png`](architecture-components.png) | the components and trust boundaries, in official AWS icons — comparable side by side with the customer's own current-state diagram. Draws **both flows**: green `1a`–`14a` (OBO, no consent) and orange `1b`–`14b` + `★` (consent), with a derived step table per flow | `python3 infra/render_components.py` |
+> | [`architecture-deploy-flow.png`](architecture-deploy-flow.png) | deploy-time flow in sequence form, 21 numbered edges. START is the operator shell, END a tagged live runtime — the one flow with no end user in it | `python3 infra/render_diagrams.py` |
+> | [`architecture-obo-flow.png`](architecture-obo-flow.png) | the OBO flow (Google Drive) in sequence form, 17 numbered edges. START and END are both the user, with ONE invocation between them and no consent screen anywhere on the canvas | `python3 infra/render_diagrams.py` |
+> | [`architecture-consent-flow.png`](architecture-consent-flow.png) | the consent flow (GitHub) in sequence form, 26 numbered edges. START and END are both the user, but TWO invocations sit between them because a human acts in the middle | `python3 infra/render_diagrams.py` |
 >
 > Run from `solution/`. Both renderers are matplotlib-only — no Node, no Docker,
 > nothing leaves the machine — and refuse to emit a PNG that fails their checks.
+>
+> ⚠️ **There are THREE independent numbering schemes across these four PNGs.** The
+> components diagram suffixes its badges by flow: steps `1a`–`5a` / `1b`–`5b` are shared,
+> and the paths diverge at `6` into `6a`–`14a` (OBO) and `6b`–`14b` + `★` (consent). Each
+> request-flow PNG numbers its own single flow contiguously and unsuffixed — `1`–`17` on
+> the OBO diagram, `1`–`26` on the consent diagram — so the same integer means different
+> things on the two canvases. The deploy diagram runs `1`–`21` in a fourth, unrelated
+> sequence. None is wrong, but a step number is meaningless without naming the diagram
+> it came from. `render_diagrams.py` and `render_components.py` are the authoritative
+> sources for their own numbering.
 
 ## Coverage: is everything available in CloudFormation?
 
@@ -37,7 +48,7 @@ all with `tagOnCreate: true`):
 Also available if ever needed: `Gateway`, `GatewayTarget`, `WorkloadIdentity`,
 `ApiKeyCredentialProvider`, `Browser`, `CodeInterpreter`, `TokenVault`.
 
-### The one true gap
+### The one imperative step
 
 **CloudFormation cannot build a container image.** `AWS::BedrockAgentCore::Runtime`
 requires a `ContainerUri` that already exists in ECR. So deployment is two-stage
@@ -48,7 +59,9 @@ with a build in between — `scripts/cfn_build.py` fills that slot:
    (build plane)          (source→ECR)              (the agent)
 ```
 
-This is inherent to CloudFormation, not a gap in AgentCore's coverage.
+Image building is outside what CloudFormation does; the step is imperative for that
+reason, and it creates nothing — it only puts an image in a repository the stack
+declares.
 
 ### Not created by CloudFormation
 
