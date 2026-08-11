@@ -19,7 +19,7 @@ human action — the one place on the whole canvas where a person has to act —
 after they have already clicked Approve. This is also why the URL is reprinted on the
 existing-provider path: it is reissued whenever a provider is replaced.
 
-Nothing here touches the OBO flow. The Google Drive path (8a-10a) reaches no vault
+Nothing here touches the delegation flow. The Google Drive path (8a-10a) reaches no vault
 entry at all — its credential is a service-account key in Secrets Manager and the
 diagram routes that arrow around the vault tile deliberately, so this script's absence
 would not affect it.

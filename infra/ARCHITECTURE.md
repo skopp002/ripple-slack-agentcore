@@ -7,13 +7,13 @@ diagram are the authoritative text alternative.
 Four views, kept separate because they answer different questions:
 
 - **Component view.** What the pieces are and where the trust boundaries fall —
-  the counterpart to the customer's own current-state diagram. The only view that
+  the counterpart to Ripple's own current-state diagram. The only view that
   draws both request flows on one canvas, which is why its steps carry `a` / `b`
   suffixes to tell them apart.
 - **Deploy flow.** What the operator runs and what CloudFormation creates. Starts at
   an operator shell and ends at a live, tagged runtime endpoint — the one flow of the
   three with no end user in it.
-- **OBO flow.** How a question is answered from a source that needs no consent screen
+- **Delegation flow.** How a question is answered from a source that needs no consent screen
   (Google Drive). Starts and ends at the user, in **one** invocation.
 - **Consent flow.** How a question is answered from a source that does need one
   (GitHub). Starts and ends at the user, but across **two** invocations, because a
@@ -31,10 +31,29 @@ Ready to open, no tooling needed:
 
 | View | PNG |
 |---|---|
-| Component architecture | [`architecture-components.png`](architecture-components.png) |
+| **Component architecture — CURRENT (v3)** | [`architecture-components-v3.png`](architecture-components-v3.png) |
+| Component architecture — v1, superseded | [`architecture-components.png`](architecture-components.png) |
 | Deploy flow | [`architecture-deploy-flow.png`](architecture-deploy-flow.png) |
-| OBO flow — no consent screen | [`architecture-obo-flow.png`](architecture-obo-flow.png) |
+| Delegation flow (M2) — no consent screen | [`architecture-delegation-flow.png`](architecture-delegation-flow.png) |
 | Consent flow — one click per user, per source | [`architecture-consent-flow.png`](architecture-consent-flow.png) |
+
+> ⚠️ **The v1 component PNG embedded further down this page is superseded, and one of
+> its labels is actively wrong.** It calls the Google Drive path "OBO", while
+> `agent/agent.py` reserves `ON_BEHALF_OF_TOKEN_EXCHANGE` for a *different* mechanism —
+> so a reader who knows the code and a reader who knows that diagram disagree about
+> which arrows are which. **The word "OBO" is retired everywhere else in this repo for
+> exactly that reason** — the prose on this page says `M2` / delegation where it used to
+> say OBO, and `architecture-obo-flow.png` is now
+> [`architecture-delegation-flow.png`](architecture-delegation-flow.png). v1 is left
+> unedited on purpose: it is a record of what the diagram used to claim, and rewriting it
+> would destroy the diff its successors' comments refer to. So the label below is wrong
+> *as history*, not as an oversight. **Read
+> [`architecture-components-v3.png`](architecture-components-v3.png) instead**, which
+> names three mechanisms explicitly (`M1` consent, `M2` delegation, `M3` token
+> exchange), draws all five target sources, and shows AgentCore Identity as the only
+> token client in the system. v1 stays on this page only because the surrounding prose
+> and the zone tables below describe its layout;
+> [`infra/README.md`](README.md) has the full version table.
 
 **One diagram per flow, and the filename says which flow.** The three flow PNGs are the
 numbered flows below drawn as sequence diagrams (one row per edge, read top to bottom),
@@ -47,22 +66,23 @@ deployed and what talks to what*, which a strictly ordered sequence cannot show 
 glance, and it is the one drawing that puts both request flows on one canvas.
 
 ⚠️ **The components diagram numbers the two request stories differently.** There, steps
-`1`–`5` are shared and the flows run `6a`–`14a` (OBO) and `6b`–`14b` (consent). Here the
-numbering is per flow and contiguous: deploy `1`–`21`, OBO `1`–`17`, consent `1`–`26`.
+`1`–`5` are shared and the flows run `6a`–`14a` (delegation) and `6b`–`14b` (consent). Here
+the numbering is per flow and contiguous: deploy `1`–`21`, delegation `1`–`17`, consent `1`–`26`.
 Neither scheme is derived from the other, so a step number is meaningless without naming
 the diagram it came from.
 
 ```bash
 open infra/architecture-components.png infra/architecture-deploy-flow.png \
-     infra/architecture-obo-flow.png infra/architecture-consent-flow.png
+     infra/architecture-delegation-flow.png infra/architecture-consent-flow.png
 ```
 
 Regenerate:
 
 ```bash
-python3 infra/render_diagrams.py           # the deploy, OBO and consent flow PNGs
+python3 infra/render_diagrams.py           # the deploy, delegation and consent flow PNGs
 python3 infra/render_diagrams.py --check   # assert edge numbers still match this file
-python3 infra/render_components.py         # the component PNG
+python3 infra/render_components_v3.py      # the CURRENT component PNG
+python3 infra/render_components.py         # the v1 component PNG, embedded below
 ```
 
 Both renderers use matplotlib only — no Node, no Docker, nothing leaves the machine.
@@ -121,6 +141,20 @@ Two arrows carry the security argument, and they are deliberately distinct:
 The consequence is the whole point: GitHub itself trims the results, so the agent
 has no path to widen a user's access even if the prompt asks it to.
 
+### The managed Harness is not on this canvas
+
+`infra/04-harness.yaml` (opt-in, `DEPLOY_HARNESS=true`) adds an
+`AWS::BedrockAgentCore::Harness` inside the AWS-account zone: a **second agent** running the
+same product with the loop executed service-side, configuration instead of code. It is not
+drawn in any view above, and that omission is deliberate — none of the four flows change on
+it. A harness overrides the container's `ENTRYPOINT`, so `agent/agent.py` never runs, and the
+delegation flow below has **no** harness equivalent: with no `RequestHeaderConfiguration` the
+tool path cannot read the caller's `Authorization` header, so no verified email exists to sign
+a Google assertion with, and the template ships no Drive tool rather than a domain-wide one.
+Drawing a harness tile would put a box on the canvas that participates in exactly one of the
+three mechanisms (`M1`, over the tools Gateway) and would invite reading the green arrows as
+available there. See README step 12 and `CODE-WALKTHROUGH.md` § *The managed Harness route*.
+
 ## State model
 
 **Every layer of this solution is stateless per request. That is a deliberate
@@ -134,7 +168,8 @@ unused.
 | CLI client | New session id every run, so no two invocations are grouped | `client/ask.py` — persist the id instead of minting it |
 | Runtime entrypoint | Fresh `Agent` per invocation; reads no history, writes none | `agent/agent.py` `invoke()` — see the STATEFUL block in its docstring |
 | AgentCore Memory | Created by `02-runtime.yaml`, id injected as `AGENTCORE_MEMORY_ID`, never read | No infra change needed; wire up the read/write |
-| Tools Gateway (MCP) | Not built yet | Pin `supportedVersions` when built — see below |
+| AgentCore Memory, *on the harness* | **Read and written by AWS** — the one place in this repo where conversations persist. `Memory.ActorId` is left unset on purpose; the partition comes from the caller-controlled `actorId` on `InvokeHarness` | `infra/04-harness.yaml` `Memory:` — and the caller must derive `actorId` from the verified `sub` |
+| Tools Gateway (MCP) | **Deployed** (`infra/03-gateways.yaml`), `supportedVersions` pinned, GitHub target live | Route a source through it per-source with `<SOURCE>_VIA=GATEWAY` — see below |
 
 What statelessness buys, concretely: any runtime instance can serve any turn, so
 scaling out needs no sticky routing and a cold start loses nothing; and cross-user
@@ -176,26 +211,43 @@ user data, so deletion becomes a real code path.
 The [MCP 2026-07-28 spec](https://aws.amazon.com/blogs/machine-learning/how-agentcore-gateway-supports-the-mcp-2026-07-28-spec/)
 moved MCP in the same direction: protocol-level sessions are gone (no
 `Mcp-Session-Id`, no `initialize` handshake), every tool call is self-contained,
-and application state is carried in explicit tool parameters instead. Which means
-our Tools Gateway needs no session infrastructure when we build it, and the
-stateless design above is the one the protocol now assumes.
+and application state is carried in explicit tool parameters instead. So the Tools
+Gateway needs no session infrastructure, and the stateless design above is the one the
+protocol now assumes.
 
-When the Gateway is built, **pin the version explicitly** — a Gateway created
-without `supportedVersions` serves `2025-03-26` to any client that omits the
-`MCP-Protocol-Version` header:
+**Both gateways are deployed** — `infra/03-gateways.yaml`, a separate stack because the
+runtime and the gateways depend on each other (03 imports the runtime ARN; 02 wants the
+tools gateway URL, hence a two-pass deploy). The version is **already pinned** there:
 
-```bash
-aws bedrock-agentcore-control update-gateway --gateway-identifier "$GW_ID" \
-  --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25","2026-07-28"]}}'
+```yaml
+ProtocolConfiguration:
+  Mcp:
+    SupportedVersions: ['2025-11-25', '2026-07-28']
 ```
 
-Two traps. `update-gateway` **replaces** the array rather than appending, so send
-the complete desired list or you silently drop a version a client still uses. And
-version translation does not cover elicitation or sampling, so a `2025-*` client
-calling a `2026-*` server tool that needs either fails with `-32021` — roll clients
-forward before removing old versions. Changing the protocol version does not touch
-the inbound authorizer or the outbound OAuth credential provider, so the per-user
-GitHub token flow is unaffected.
+It is pinned because a gateway created *without* `supportedVersions` serves `2025-03-26`
+to any client that omits the `MCP-Protocol-Version` header. `2025-11-25` is what
+`mcp==1.28.1` (`requirements.txt`) advertises as its latest, so the client negotiates
+without a downgrade.
+
+Two traps if that list is edited. `update-gateway` **replaces** the array rather than
+appending, so send the complete desired list or you silently drop a version a client
+still uses. And version translation does not cover elicitation or sampling, so a
+`2025-*` client calling a `2026-*` server tool that needs either fails with `-32021` —
+roll clients forward before removing old versions. Changing the protocol version touches
+neither the inbound authorizer nor the outbound OAuth credential provider, so the
+per-user GitHub token flow is unaffected.
+
+⚠️ **The pin lives on the tools gateway only.** The ingress gateway has no
+`ProtocolType`, which makes it an HTTP front door rather than an MCP server, so it has no
+protocol version to pin — and adding `ProtocolType: MCP` there breaks the stack at
+CREATE, because an MCP gateway refuses the `Http.AgentcoreRuntime` target. That file's
+header explains why at length; the short version is that the omission is load-bearing.
+
+Routing a source through the tools gateway is **per-source and opt-in** (`<SOURCE>_VIA`,
+default `IN_PROCESS`), so deploying the gateway did not move any traffic on its own.
+Google Drive can never move: the gateway's `OAuthGrantType` enum has no value for a
+Google-signed service-account assertion.
 
 ### How to view the Mermaid source
 
@@ -216,7 +268,7 @@ To generate PNGs from the Mermaid source itself rather than via
 brew install node
 npx -y @mermaid-js/mermaid-cli -i infra/ARCHITECTURE.md -o /tmp/arch.md
 # writes /tmp/arch-1.png … /tmp/arch-3.png, one per mermaid block:
-# the deploy flow, the OBO flow, the consent flow
+# the deploy flow, the delegation flow, the consent flow
 ```
 
 `render_diagrams.py` exists precisely so the PNGs do not depend on that: it uses
@@ -242,7 +294,7 @@ not return to an end user, because no end user takes part in it.
 
 Edges 2 and 11 target the CloudFormation service, which then creates the `[CFN]`
 resources grouped below as stack 1 and stack 2. The runtime endpoint `live` is created by
-edge 11 but sends no deploy-time message of its own — it is where the OBO and consent
+edge 11 but sends no deploy-time message of its own — it is where the delegation and consent
 flows both begin their authenticated invoke.
 
 ```mermaid
@@ -406,7 +458,7 @@ credential provider issues a new callback URL.
 
 ---
 
-## OBO flow
+## Delegation flow
 
 Answering from Google Drive, the source that needs no consent screen. **START and END are
 both the user**, and exactly **one** invocation sits between them: the question asked at
@@ -455,7 +507,7 @@ flowchart TB
     CLI -->|"17 END - the answer is printed with citations. One invocation, no consent screen."| USER
 ```
 
-### OBO flow — numbered edges (text alternative)
+### Delegation flow — numbered edges (text alternative)
 
 | # | From | To | What happens |
 |---|---|---|---|
@@ -498,7 +550,7 @@ An issuer permitting self-signup signs a colleague's address quite genuinely, so
 `email_verified` and the domain allowlist exist only at edge 8 — and edge 11 is a
 domain-wide read primitive without them.
 
-### OBO flow — ASCII fallback
+### Delegation flow — ASCII fallback
 
 ```
   START at (1) and END at (17) are the SAME participant: the user.
@@ -561,15 +613,15 @@ domain-wide read primitive without them.
 
 ## Consent flow
 
-Answering from GitHub, the source that cannot do the OBO exchange: its token endpoint
-answers the exchange grant with `unsupported_grant_type` — verified empirically, not
-assumed — so the user's own OAuth token has to be brokered and vaulted instead.
+Answering from GitHub, the source that cannot do the M3 token exchange: its token
+endpoint answers the RFC 8693 grant with `unsupported_grant_type` — verified empirically,
+not assumed — so the user's own OAuth token has to be brokered and vaulted instead.
 
 **START and END are both the user, but two invocations sit between them** (edges 5 and
 18), because a human acts in the middle and the runtime will not hold a request open for
 one (`CONSENT_WAIT_SECONDS = 0`, `NoWaitTokenPoller`). Edges 1–14 answer nothing; edges
-18–26 answer the same question. That is why this flow is half again as long as the OBO
-one: the first ask returns a URL instead of content, and the client re-asks afterwards.
+18–26 answer the same question. That is why this flow is half again as long as the
+delegation one: the first ask returns a URL instead of content, and the client re-asks afterwards.
 
 **Approving is not vaulting.** Edge 15 is the click; edge 17 is what stores the token. If
 the return URL is not registered, or the client never completes the session, the user
@@ -654,10 +706,10 @@ flowchart TB
 | 25 | Runtime endpoint | Caller | HTTP response |
 | **26** | Caller | User | **END.** The answer is printed with citations. Every later question starts here |
 
-**The guarantee is the same one the OBO flow makes.** Edge 22 calls GitHub with a token
-representing the **user**, so GitHub itself trims the results. GitHub is on this flow
-because it has to be, not by choice: the OBO flow needs the *source* to accept a brokered
-assertion, and SSO into a vendor is not that.
+**The guarantee is the same one the delegation flow makes.** Edge 22 calls GitHub with a
+token representing the **user**, so GitHub itself trims the results. GitHub is on this
+flow because it has to be, not by choice: a brokered exchange needs the *source* to accept
+a brokered assertion, and SSO into a vendor is not that.
 
 ### Consent flow — ASCII fallback
 
@@ -764,10 +816,10 @@ assertion, and SSO into a vendor is not that.
 represents the **user**, so the source's own ACLs trim the results. They differ only in
 *who consents* and *who holds a long-lived credential*.
 
-| | OBO flow | Consent flow |
+| | Delegation flow (M2) | Consent flow (M1) |
 |---|---|---|
 | User sees a consent screen | never | once per user, per source (edge 15) |
-| Invocations per question | one (OBO edges 1–17) | two the first time (consent edges 5 and 18), one afterwards |
+| Invocations per question | one (delegation edges 1–17) | two the first time (consent edges 5 and 18), one afterwards |
 | Long-lived credential at rest | the Google service-account key in Secrets Manager | a refresh token in the AgentCore Identity vault |
 | Revocation | narrow the domain-wide delegation scopes, or delete the key | revoke in the vendor **and** the vault |
 | Requires | the **source** accepts a brokered assertion for the user | the source has a standard OAuth app, and its callback URL is registered (deploy edge 17) |
@@ -776,9 +828,11 @@ represents the **user**, so the source's own ACLs trim the results. They differ 
 ### Which flow runs is configuration, not code
 
 `agent.py::_flow_for()` reads `<SOURCE_KEY>_AUTH_FLOW` and defaults to
-`USER_FEDERATION`. Moving a source from the consent flow onto the OBO flow is a
-CloudFormation parameter change, not a code change (requirement FR-34) — consent edge 20
-is the call site that does not change with it:
+`USER_FEDERATION`. Moving a source from the consent flow (M1) onto the token-exchange flow
+(M3) is a CloudFormation parameter change, not a code change (requirement FR-34) — consent
+edge 20 is the call site that does not change with it. Note this variable cannot select the
+**delegation** flow (M2): that is chosen by a source's `credential` axis, and the delegation
+flow is the one drawn above:
 
 ```bash
 export GITHUB_AUTH_FLOW=ON_BEHALF_OF_TOKEN_EXCHANGE   # do NOT do this — see below
@@ -786,13 +840,13 @@ python3 scripts/deploy.py
 ```
 
 **GitHub stays on the consent flow on purpose.** Its token endpoint answers the exchange
-grant with `{"error": "unsupported_grant_type"}` — verified empirically, not assumed. The
-OBO flow requires the **source** to accept a brokered assertion; SSO *into* a vendor is
-not enough, because SSO changes login, not API authorization.
+grant with `{"error": "unsupported_grant_type"}` — verified empirically, not assumed. A
+token exchange requires the **source** to accept a brokered assertion; SSO *into* a vendor
+is not enough, because SSO changes login, not API authorization.
 
-An OBO failure is deliberately **not** turned into a consent prompt. `_capture()` in
-`agent.py` treats an interactive URL returned on an OBO source as an error, because
-the user cannot self-grant what an admin controls (FR-5a).
+A non-consent failure is deliberately **not** turned into a consent prompt. `_capture()` in
+`agent.py` treats an interactive URL returned on a `ON_BEHALF_OF_TOKEN_EXCHANGE` source as
+an error, because the user cannot self-grant what an admin controls (FR-5a).
 
 ### Worked example: Google Drive with Okta as the IdP
 
@@ -811,14 +865,15 @@ authorizes an API call. So the Okta JWT Ripple receives cannot be replayed at Dr
 and there is no `audience` value that would make it work.
 
 Zero user consent is still reachable — by impersonation rather than by brokering, which
-is the mechanism the OBO flow above draws:
+is the mechanism the delegation flow above draws:
 
 **Domain-wide delegation (the path that works today).** Google's token endpoint does
 accept `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`, but only for an
 assertion signed by a **Google service account key**, with the target user's Workspace
 address in the `sub` claim. A Workspace super-admin grants the scopes once; after that
 the service account mints per-user Drive tokens with no user interaction at all. That is
-OBO edges 10–12, and OBO edge 8 is what makes the `sub` on edge 11 trustworthy.
+delegation edges 10–12, and delegation edge 8 is what makes the `sub` on edge 11
+trustworthy.
 
 Identity still propagates end to end — via the impersonation subject rather than a
 brokered assertion:
@@ -847,14 +902,15 @@ Setup, once:
 ⚠️ **Blast radius.** A DWD service account can impersonate **any** user in the domain
 for the granted scopes. It is an admin-level credential with no expiry and no revocation
 short of deleting it — keep the scope list minimal and read-only, keep the key in Secrets
-Manager, and treat losing that key as a domain-wide compromise. It is also the reason OBO
-edge 8 is fail-closed on three gates before edge 11 names a subject.
+Manager, and treat losing that key as a domain-wide compromise. It is also the reason
+delegation edge 8 is fail-closed on three gates before edge 11 names a subject.
 
 **Drive cannot use the RFC 8693 token exchange, and this is not tenant-dependent.**
 AgentCore's `googleOauth2ProviderConfig` accepts only `clientId` / `clientSecret` /
 `clientSecretConfig` / `clientSecretSource` — it has no `onBehalfOfTokenExchangeConfig`
 member, unlike `customOauth2ProviderConfig`. The built-in Google provider is consent-only
-by construction, which is why the OBO flow above reaches Drive by impersonation instead.
+by construction, which is why the delegation flow above reaches Drive by impersonation
+instead.
 
 Full setup, including the Okta-SSO-vs-delegation distinction and a standalone
 verification script: [`../docs/GOOGLE-DRIVE-OKTA-SETUP.md`](../docs/GOOGLE-DRIVE-OKTA-SETUP.md).

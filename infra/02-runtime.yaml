@@ -38,13 +38,25 @@ Description: >
 # read. The vault performs 7b, 8b and 9b, all of which are drawn dashed or as the
 # consent EXTENSION.
 #
-# WHAT THIS TEMPLATE DOES NOT CREATE, though the diagram draws it. Both Gateways are
-# tagged TARGET and dashed: there is no ingress gateway resource here, so the
-# AuthorizerConfiguration below IS the front door the diagram assigns to the "Ingress
-# AgentCore Gateway" tile (inbound auth: validate the IdP's JWT), and there is no
-# tools gateway, so the agent calls its tools in-process rather than through the
-# "Tools AgentCore Gateway" tile that steps 7a/8a/10a/11a route through. The
-# Okta-guarded MCP server (also TARGET) has no resource here at all. Neither does the
+# WHAT THIS TEMPLATE DOES NOT CREATE, though the diagram draws it. Both Gateways now
+# exist, but they live in `03-gateways.yaml`, NOT here — see that file's header for why
+# they are a separate stack (a runtime↔gateway circular dependency) and what each one
+# does. Two consequences for reading THIS template:
+#
+#   • The AuthorizerConfiguration below is STILL a real front door, not a vestige. The
+#     runtime stays directly addressable, and the ingress gateway forwards the caller's
+#     token unchanged (JWT_PASSTHROUGH), so this authorizer validates traffic on BOTH
+#     paths. What changes is that it is no longer the ONLY front door — which is exactly
+#     why AllowedWorkloadConfiguration below matters. Both doors are open TODAY: closing
+#     the direct one needs the ingress target moved off JWT_PASSTHROUGH first, for
+#     reasons spelled out on that field.
+#   • The agent still calls tools in-process by default. Routing a source through the
+#     Tools Gateway (steps 7a/8a/10a/11a) is per-source and opt-in, driven by the `via`
+#     axis in agent.py's SOURCES table. Google Drive can NEVER move — the Gateway's
+#     OAuthGrantType enum has no value for a Google-signed service-account assertion.
+#
+# The Okta-guarded MCP server (still TARGET) has no resource here at all; it is a
+# conditional, off-by-default target in 03-gateways.yaml. Neither does the
 # Slack front door (DEFERRED). Secrets Manager appears as a tile because two
 # credentials live there, but this stack only takes their ARNs as parameters and
 # grants scoped reads — GithubClientSecretArn and GoogleSaSecretArn are created by
@@ -95,6 +107,70 @@ Parameters:
     Type: String
     Description: Auth0 API identifier, used as the allowed JWT audience.
 
+  # ---- Tools Gateway routing (see agent.py's ROUTE / `via` note) ----
+  ToolsGatewayUrl:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. MCP endpoint of the tools gateway from 03-gateways.yaml. Injected as
+      RIPPLE_TOOLS_GATEWAY_URL. Empty means no gateway is reachable, and any source
+      configured for GATEWAY routing falls back to in-process with a startup warning —
+      so the agent still runs with no gateway deployed.
+  GithubVia:
+    Type: String
+    Default: ''
+    AllowedValues: ['', 'IN_PROCESS', 'GATEWAY']
+    Description: >
+      Where GitHub calls are made from. Empty defers to the agent's default
+      (IN_PROCESS). GATEWAY routes SEARCH through the tools gateway so this container
+      never holds a GitHub token for search — but it currently costs answer quality:
+      an OpenAPI target cannot send GitHub's text-match Accept header, so hits arrive
+      without quotable snippets and strict grounding lands at LOW confidence. Naming
+      the trade-off here because "the gateway broke search" is the wrong diagnosis.
+
+  # ---- Gateway-bypass prevention (see the Runtime's authorizer) ----
+  IngressGatewayArn:
+    Type: String
+    Default: ''
+    Description: >
+      ⚠️ DO NOT SET THIS WHILE THE INGRESS GATEWAY'S TARGET IS ON JWT_PASSTHROUGH. It
+      is empty on purpose, and setting it today takes the runtime DOWN — including the
+      gateway path it is supposed to permit. Verified.
+
+      What it is for: 03-gateways.yaml fronts this runtime with an ingress gateway using
+      JWT_PASSTHROUGH, which means the runtime keeps accepting the same tokens the
+      gateway accepts — so anyone with the runtime ARN can skip every gateway-side
+      control. AWS's documented closure for a CUSTOM_JWT runtime is
+      AllowedWorkloadConfiguration naming that gateway, which is what this parameter
+      feeds. It is a parameter rather than a lookup because 03 imports the runtime ARN
+      from this stack while this stack needs 03's gateway ARN — circular inside one
+      stack, so it is a two-pass deploy by construction.
+
+      What actually happens when it is set TODAY: BOTH the gateway path and the direct
+      path return 401 "Transaction token required: authorizer has
+      AllowedWorkloadConfiguration configured". Not a mismatch — the token is ABSENT. A
+      JWT_PASSTHROUGH target has no outbound credential to fetch, so it never calls
+      AgentCore Identity, never mints the Workload Access Token, and never stamps the
+      chain this authorizer introspects. Nothing can satisfy it.
+
+      ⚠️ WHAT THAT DOES *NOT* MEAN: it is not a limitation of this field, and the field
+      is not useless. An otherwise-identical gateway differing ONLY in OAUTH outbound
+      instead of JWT_PASSTHROUGH DOES stamp the chain and DOES pass this check — proven
+      by a probe that returned a bare empty-body 401 instead of "Transaction token
+      required", i.e. it got past the workload check and failed later on the token
+      itself, with CloudTrail showing the WAT mint firing only for that target. The
+      blocker is therefore the INGRESS TARGET'S CREDENTIAL TYPE plus one claim
+      trade-off (an exchanged token may drop `email`/`email_verified`, which M2 needs),
+      not the service. Full evidence, the correct test method, and the ruled-out
+      alternatives are in 03-gateways.yaml's IngressGateway comment, mitigation (2) —
+      read that before touching this.
+
+      So THE BYPASS IS OPEN, deliberately, documented, and CLOSEABLE — the closure is a
+      design trade someone has to choose, not a missing feature. Until it is chosen, the
+      `aud` restriction on the authorizer below is the only ingress control in force, and
+      setting this parameter on its own does not close the bypass: it replaces a
+      partly-controlled runtime with an unreachable one.
+
   # ---- Bedrock ----
   BedrockModelId:
     Type: String
@@ -141,7 +217,7 @@ Parameters:
       Both end at the same guarantee (the API call runs as the user, so native ACLs
       trim results); they differ in who consents and who holds long-lived credentials.
       LEAVE THIS AT USER_FEDERATION FOR GITHUB. GitHub's token endpoint rejects the
-      exchange grant with `unsupported_grant_type` (verified empirically), so OBO
+      exchange grant with `unsupported_grant_type` (verified empirically), so the exchange
       cannot work against it regardless of how identity is arranged. The parameter
       exists so a source can be migrated between paths by CONFIG rather than a code
       change (requirement FR-34), which is what makes an Okta-federated source such as
@@ -226,6 +302,7 @@ Parameters:
 Conditions:
   UseExternalSecret: !Not [!Equals [!Ref GithubClientSecretArn, '']]
   UseGoogleDrive: !Not [!Equals [!Ref GoogleSaSecretArn, '']]
+  RestrictToIngressGateway: !Not [!Equals [!Ref IngressGatewayArn, '']]
 
 # Enforced at CREATE/UPDATE time, before any resource is touched — a stack that
 # would deploy an unbounded impersonation subject is rejected rather than deployed
@@ -455,11 +532,74 @@ Resources:
             - RepoUri: !ImportValue
                 'Fn::Sub': '${FoundationStackName}-EcrRepositoryUri'
               Tag: !Ref ImageTag
-      # The runtime IS the secured front door — no ingress gateway needed for MVP.
+      # The runtime is A secured front door — and since 03-gateways.yaml exists, no
+      # longer the only one. The ingress gateway uses JWT_PASSTHROUGH, so it forwards
+      # the caller's token unchanged and this authorizer validates BOTH paths with the
+      # same issuer and audience. That is what makes passthrough workable at all: there
+      # is exactly one definition of an acceptable token, in one place.
       AuthorizerConfiguration:
         CustomJWTAuthorizer:
           DiscoveryUrl: !Sub 'https://${Auth0Domain}/.well-known/openid-configuration'
           AllowedAudience: [!Ref Auth0Audience]
+          # ⚠️ GATEWAY-BYPASS PREVENTION — WIRED UP, AND INACTIVE BECAUSE THE INGRESS
+          # TARGET IS ON JWT_PASSTHROUGH. This is the code path; the DECISION and the
+          # EVIDENCE are on the IngressGatewayArn parameter and in 03-gateways.yaml's
+          # IngressGateway comment. Read one of those before enabling this.
+          #
+          # WHY IT EXISTS. Because the gateway forwards tokens unchanged, a valid token
+          # for the gateway is also a valid token for the runtime — so a caller who knows
+          # the runtime ARN reaches the agent DIRECTLY and skips every gateway-side
+          # control. Authentication cannot detect that: the token is genuine either way.
+          # What distinguishes the two paths is the workload identity CHAIN, and this is
+          # the only field that inspects it. So this really is the right field.
+          #
+          # WHY IT IS OFF. Setting it makes the data plane require a transaction token
+          # carrying that chain, and a JWT_PASSTHROUGH target never produces one — it has
+          # no outbound credential to fetch, so it never calls AgentCore Identity and
+          # never mints the WAT. Every path 401s, gateway included; the runtime becomes
+          # unreachable, not degraded.
+          #
+          # ⚠️ AND THAT IS A PROPERTY OF THE TARGET, NOT OF THIS FIELD. An
+          # otherwise-identical probe gateway on OAUTH outbound passes this check
+          # (empty-body 401 rather than "Transaction token required", with the WAT mint
+          # visible in CloudTrail for that target only). So enabling this is a TWO-part
+          # change — flip the ingress target to OAUTH outbound, then set the parameter —
+          # and the reason it has not been done is the claim trade-off described on the
+          # parameter, not a service gap. Do not read "inactive" as "impossible", and do
+          # not set this alone.
+          #
+          # Until that change is made, resolving to AWS::NoValue is the WORKING
+          # configuration and the bypass is a known, documented exposure — not a rollout
+          # someone forgot to finish.
+          AllowedWorkloadConfiguration: !If
+            - RestrictToIngressGateway
+            - HostingEnvironments:
+                - Arn: !Ref IngressGatewayArn
+            - !Ref 'AWS::NoValue'
+      # ⚠️ WITHOUT THIS, THE AGENT NEVER SEES WHO IS ASKING. The allowlist defaults to
+      # FORWARDING NOTHING — not "everything except the restricted list" — so omitting it
+      # means `context.request_headers` arrives empty, `_caller_jwt()` returns "" and every
+      # per-user source is unavailable for the turn. The runtime still authenticates the
+      # caller (the authorizer above runs on the platform side, before the container), so
+      # the symptom is NOT a 401. It is a 200 whose body says `"user": "anonymous"` with
+      # `connected_sources: []`, which reads like an unconsented user rather than a
+      # misconfiguration. That is exactly how this was missed: authentication working and
+      # identity propagation failing look identical from the outside.
+      #
+      # `Authorization` IS ALLOWLISTABLE ONLY BECAUSE CustomJWTAuthorizer IS SET ABOVE.
+      # The service requires that pairing — the header may be forwarded only to a runtime
+      # doing OAuth inbound auth, so a SigV4 runtime cannot ask for it (which is the same
+      # reason `_caller_jwt()` fails closed and documents the SigV4 case). Deleting the
+      # authorizer therefore breaks this line too; they are one decision.
+      #
+      # Nothing else belongs here. The list is a capability grant, and every header on it
+      # is one the agent must treat as caller-controlled: `Authorization` is safe to
+      # forward precisely because the platform VALIDATED it before the container ran, and
+      # `identity_claims.verified_email()` re-verifies it anyway. A header the caller can
+      # set freely (say an X-User-Id) would become a second identity channel and undo the
+      # single-channel property tests/test_caller_identity.py exists to hold.
+      RequestHeaderConfiguration:
+        RequestHeaderAllowlist: ['Authorization']
       EnvironmentVariables:
         BEDROCK_MODEL_ID: !Ref BedrockModelId
         # Provider Name is createOnly (not GetAtt-able) — rebuild the same value.
@@ -469,6 +609,12 @@ Resources:
         # Read by agent.py `_flow_for`. Naming contract: <SOURCE_KEY>_AUTH_FLOW, so a
         # new source needs no agent change — only a new parameter + env var here.
         GITHUB_AUTH_FLOW: !Ref GithubAuthFlow
+        # Read by agent.py `_via_for`. Same naming contract as <SOURCE_KEY>_AUTH_FLOW:
+        # <SOURCE_KEY>_VIA, so a new source needs no agent change. Orthogonal to the
+        # flow above — route and OAuth variant are independent choices.
+        GITHUB_VIA: !Ref GithubVia
+        # Read by agent/gateway_tool.py. Empty disables gateway routing entirely.
+        RIPPLE_TOOLS_GATEWAY_URL: !Ref ToolsGatewayUrl
         # Setting this ENABLES the Google Drive source. Empty string = disabled, which
         # agent.py treats as "skip the row" (see _is_enabled).
         GOOGLE_SA_SECRET_ARN: !Ref GoogleSaSecretArn
@@ -532,18 +678,51 @@ Resources:
       Tags: {project_name: !Ref ProjectTagValue}   # MAP shape
 
 Outputs:
+  # Three of these carry an Export because 03-gateways.yaml imports them. Exporting a
+  # value LOCKS it: CloudFormation refuses to delete or replace an exported value while
+  # another stack imports it, so once the gateway stack is up, replacing the runtime or
+  # the GitHub provider requires tearing that stack down first. That is a feature here —
+  # replacing the provider silently invalidates the gateway target's credential and
+  # every user's consent, and being forced to notice is better than discovering it at
+  # answer time.
   RuntimeArn:
-    Description: Set as RIPPLE_RUNTIME_ARN in dev.env.
+    Description: >
+      Set as RIPPLE_RUNTIME_ARN in dev.env. Also imported by 03-gateways.yaml as the
+      ingress gateway's target.
     Value: !GetAtt Runtime.AgentRuntimeArn
+    Export:
+      Name: !Sub '${AWS::StackName}-RuntimeArn'
   RuntimeId:
     Value: !GetAtt Runtime.AgentRuntimeId
   RuntimeEndpointArn:
     Value: !GetAtt RuntimeEndpoint.AgentRuntimeEndpointArn
   EndpointName:
-    Description: Set as RIPPLE_RUNTIME_QUALIFIER in dev.env.
+    Description: >
+      Set as RIPPLE_RUNTIME_QUALIFIER in dev.env. Imported by 03-gateways.yaml as the
+      ingress target's Qualifier, so the gateway follows version rolls with the client.
     Value: !FindInMap [Endpoint, Primary, Name]
+    Export:
+      Name: !Sub '${AWS::StackName}-EndpointName'
+  GithubProviderArn:
+    Description: >
+      Imported by 03-gateways.yaml so the GitHub gateway target reuses THIS provider.
+      Creating a second GitHub provider there would issue a new callback URL and break
+      every existing user's consent until it was pasted into the GitHub OAuth App.
+    Value: !GetAtt GithubProvider.CredentialProviderArn
+    Export:
+      Name: !Sub '${AWS::StackName}-GithubProviderArn'
   MemoryId:
     Value: !GetAtt Memory.MemoryId
+  MemoryArn:
+    Description: >
+      The same memory, as an ARN. 04-harness.yaml needs this rather than MemoryId:
+      Harness's AgentCoreMemoryConfiguration takes `Arn`, while this runtime passes
+      MEMORY_ID to the container as an id. Same resource, two shapes — and it is the
+      SAME memory on purpose, so the harness and the runtime share one store instead of
+      splitting a user's history across two agents that both claim to be Ripple.
+    Value: !GetAtt Memory.MemoryArn
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryArn'
   GithubCallbackUrl:
     Description: >
       PASTE THIS into the GitHub OAuth App's Authorization callback URL. It changes

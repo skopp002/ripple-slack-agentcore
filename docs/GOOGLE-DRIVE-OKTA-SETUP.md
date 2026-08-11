@@ -3,7 +3,7 @@
 Goal: Ripple answers from Drive and Docs content, **trimmed to what the calling user
 can see**, with **no consent screen ever shown to that user**.
 
-This is the **OBO flow** — green, steps `1a`–`14a` on
+This is the **delegation flow (M2)** — green, steps `1a`–`14a` on
 `infra/architecture-components.png`. It is the flow with **no human action at any
 step**, which is the whole reason it exists alongside the GitHub consent flow.
 
@@ -359,7 +359,7 @@ addresses.
 
 **1. Create the files as the users, in a browser — not with a script.** The service
 account is granted `drive.readonly` only (§B4), so it *cannot* create or share
-anything, by design: this component must never be able to modify a customer's Drive.
+anything, by design: this component must never be able to modify a user's Drive.
 Sign in as each user and create their files in the Drive UI.
 
 **2. Put real sentences in the body.** `search_drive()` queries
