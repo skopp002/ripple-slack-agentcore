@@ -7,7 +7,18 @@ the token it yields is exactly what the ingress gateway would receive.
 Usage:
     python client/login.py                 # interactive: prints URL+code, polls
     python client/login.py --print-token   # also print the raw access token
+    python client/login.py --copy          # copy the token to the clipboard, print only
+                                           # how long it is valid — for pasting into the
+                                           # AgentCore **Harness playground**, whose
+                                           # "JWT token" box wants exactly this value
 The token is cached at client/.token.json and reused until it expires.
+
+⚠️ THE PLAYGROUND NEEDS THIS TOKEN, NOT AWS CREDENTIALS. The harness is configured with a
+CustomJWTAuthorizer, so the console signs you in with IAM but the harness still refuses the
+session without a bearer JWT from OUR IdP ("This harness requires OAuth Bearer token
+authentication"). `--copy` exists so that box can be filled in one step. The token is a
+BEARER credential: anything holding it can act as you until it expires, so do not paste it
+into a ticket, a chat, or a screenshot.
 
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
 
@@ -16,7 +27,7 @@ login, ONCE for the session and not once per source, which is the property the b
 own sentence is making — and receives 3a/3b, the signed JWT whose `email` claim every
 per-user decision downstream traces back to (it is the value step 8a puts in an
 impersonation assertion). All four badges are drawn neutral dark rather than green or
-orange because both flows perform them identically: logging in is not where the OBO and
+orange because both flows perform them identically: logging in is not where the delegation and
 consent paths differ, and the cached token here is the same token either one carries.
 
 The diagram names that hop "against Okta". The claim is IdP-agnostic and the runtime's
@@ -34,6 +45,7 @@ guarding against.
 """
 import argparse
 import json
+import subprocess
 import sys
 import time
 import webbrowser
@@ -131,10 +143,31 @@ if __name__ == "__main__":
     ap.add_argument("--force", action="store_true", help="ignore cache, re-login")
     ap.add_argument("--print-token", action="store_true")
     ap.add_argument("--claims", action="store_true", help="print decoded claims")
+    ap.add_argument("--copy", action="store_true",
+                    help="copy the token to the clipboard for the Harness playground's "
+                         "'JWT token' box, and print only its remaining lifetime")
     args = ap.parse_args()
     tok = login(force=args.force)
     if args.print_token:
         print(tok["access_token"])
+    if args.copy:
+        access = tok["access_token"]
+        claims = jwt.decode(access, options={"verify_signature": False})
+        # macOS only, and that is deliberate: this repo's other clipboard-free paths stay
+        # portable, but silently "succeeding" without copying would be worse than saying
+        # so — you would paste a stale token and read the 403 as a harness problem.
+        try:
+            subprocess.run(["pbcopy"], input=access, text=True, check=True)
+            where = "copied to clipboard"
+        except (OSError, subprocess.CalledProcessError):
+            where = ("could NOT copy (pbcopy unavailable) — re-run with --print-token "
+                     "and copy it manually")
+        mins = int((claims.get("exp", 0) - time.time()) // 60)
+        # The token itself is NOT printed here: the point of --copy is to keep a bearer
+        # credential out of the terminal scrollback and out of any screenshot of it.
+        print(f"JWT for {claims.get('sub')} — {where}; valid {mins // 60}h {mins % 60}m")
+        print("  Paste into: AgentCore -> Harness -> Harness playground -> Configs -> "
+              "Authentication -> JWT token")
     if args.claims:
         claims = jwt.decode(tok["access_token"], options={"verify_signature": False})
         print(json.dumps(claims, indent=2))

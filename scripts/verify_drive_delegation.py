@@ -25,7 +25,7 @@ ACL trim.
 Reads no AWS resource except the one secret ARN passed in, and creates nothing.
 
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png): it
-reproduces the right-hand end of the OBO flow — steps 8a, 9a and 10a — with every
+reproduces the right-hand end of the delegation flow — steps 8a, 9a and 10a — with every
 other tile on the canvas removed. It reads the service-account key from the Secrets
 Manager tile, signs the assertion that step 8a sends to the Google OAuth2 token
 endpoint, receives back the token step 9a describes (scoped to one named user, with no

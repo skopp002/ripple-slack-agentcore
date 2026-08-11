@@ -1,0 +1,808 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Ripple Slack Assistant — the two AgentCore Gateways. INGRESS: an HTTP gateway (no
+  protocol type) whose single target is the Ripple runtime, validating the IdP's JWT
+  inbound and forwarding it unchanged (JWT_PASSTHROUGH) so the agent still sees the
+  caller's own token. TOOLS: an MCP gateway holding the outbound credential for each
+  source, so the agent never touches a source token. The two differ by more than
+  configuration — see the header. Deploy AFTER 02-runtime.yaml.
+
+# WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
+# this template builds the two tiles the diagram has always drawn DASHED and labelled
+# TARGET — "Ingress AgentCore Gateway" and "Tools AgentCore Gateway". Deploying this
+# stack is what makes them solid. Every comment in 02-runtime.yaml asserting that the
+# gateways are "not built" is superseded by this file; those comments are corrected in
+# the same change that adds this one, so the two templates never disagree.
+#
+# ─────────────────────────────────────────────────────────────────────────────────
+# THE ONE THING TO UNDERSTAND BEFORE READING: THE TWO GATEWAYS ARE DIFFERENT SHAPES.
+# ─────────────────────────────────────────────────────────────────────────────────
+# `ProtocolType` has exactly one legal VALUE (MCP), but it is an OPTIONAL property —
+# and that distinction is the whole design of this file:
+#
+#   ProtocolType: MCP  → an MCP server. Aggregates MCP targets into one virtual
+#                        tools/list, does capability sync and semantic tool search.
+#                        REJECTS Http targets. `GatewayUrl` ends in `/mcp`.
+#   ProtocolType absent → a plain HTTP front door. Accepts Http targets (an AgentCore
+#                        Runtime, or a passthrough endpoint) and routes to each by
+#                        PATH. No aggregation, no translation, no tool search.
+#                        `GatewayUrl` is the bare host.
+#
+# So the two gateways here are NOT the same resource with different targets:
+#   TOOLS   — ProtocolType: MCP, because its targets ARE tools to be aggregated.
+#   INGRESS — ProtocolType OMITTED, because its target is the RUNTIME, and AWS states
+#             plainly: "AgentCore Runtime targets can be added to gateways that don't
+#             have a protocol type set. They cannot be added to MCP protocol type
+#             gateways." Setting ProtocolType: MCP here fails at CREATE with
+#             "HTTP target configuration is not supported for gateways with MCP
+#             protocol type" — observed, not theorised.
+#
+# ⚠️ AN OMITTED ProtocolType IS LOAD-BEARING, NOT AN OVERSIGHT. The CloudFormation
+# schema declares `default: MCP` on the property, which reads as though leaving it out
+# yields an MCP gateway. It does not: the default is not applied server-side, and
+# `GetGateway` on a gateway created without it returns NO protocolType field at all
+# (verified with a throwaway stack before this template was corrected). Do not "tidy
+# up" the ingress gateway by adding ProtocolType — it will stop accepting its target.
+#
+# WHAT THIS MEANS FOR THE CLIENT CONTRACT. Because the ingress gateway is an HTTP
+# front door rather than an MCP server, it PRESERVES the runtime's request shape: a
+# caller POSTs to `<GatewayUrl>/<targetName>/invocations` with the same
+# {"prompt": ...} body client/ask.py already sends, instead of having to speak MCP.
+# client/ask.py's current path (bedrock-agentcore.<region>.amazonaws.com/runtimes/
+# <arn>/invocations) also keeps working — and, unlike the original design, KEEPS
+# WORKING — and, as configured today, keeps working. The control meant to close it
+# (AllowedWorkloadConfiguration on the runtime) cannot be enabled while this gateway's
+# target is JWT_PASSTHROUGH: a passthrough target never mints the Workload Access Token
+# that control introspects, so switching it on 401s every path including this gateway's.
+# It is therefore left off and the bypass is a documented exposure. Closeable, though —
+# an otherwise-identical gateway on OAUTH outbound passes the check. See the
+# IngressGateway resource, mitigation (2), for the measurement and the trade-off.
+#
+# WHY TWO GATEWAYS AND NOT ONE. They face opposite directions and carry opposite
+# credentials, which is the whole reason the diagram draws two tiles:
+#   INGRESS — inbound: validate the END USER's IdP JWT. Outbound: JWT_PASSTHROUGH,
+#             i.e. forward that same token to the runtime unchanged.
+#   TOOLS   — inbound: validate the AGENT. Outbound: OAUTH, i.e. swap identity for a
+#             SOURCE credential (GitHub's token, not the user's IdP token).
+# Collapsing them would mean one gateway whose outbound credential is both
+# passthrough and OAuth, which is not expressible and would not be desirable.
+#
+# ─────────────────────────────────────────────────────────────────────────────────
+# WHICH OF THE THREE MECHANISMS LANDS HERE — AND THE ONE THAT CANNOT.
+# ─────────────────────────────────────────────────────────────────────────────────
+# The vocabulary is fixed (see infra/ARCHITECTURE.md): M1 CONSENT, M2 DELEGATION,
+# M3 TOKEN EXCHANGE. "OBO" is not used as a synonym for any of them.
+#
+#   M1 CONSENT        → ON THIS GATEWAY. GithubTarget below, GrantType
+#                       AUTHORIZATION_CODE, pointing at the SAME credential provider
+#                       02-runtime.yaml already created. Same vault entry, same
+#                       one-time consent — but the token is now fetched by the
+#                       gateway rather than by agent code.
+#   M3 TOKEN EXCHANGE → ON THIS GATEWAY, when it exists. McpServerTarget below,
+#                       GrantType TOKEN_EXCHANGE. Conditional and OFF by default,
+#                       because no such server is deployed yet.
+#   M2 DELEGATION     → ⚠️ CANNOT BE ON THIS GATEWAY, EVER. This is a structural
+#                       limit, not a scheduling one. `OAuthGrantType` is exactly
+#                       {CLIENT_CREDENTIALS, AUTHORIZATION_CODE, TOKEN_EXCHANGE} —
+#                       there is NO value for "assertion signed by a Google
+#                       service-account key", and a gateway could not produce one if
+#                       there were: the signature must be made with Google's own
+#                       private key material. So Google Drive/Docs stays IN-PROCESS in
+#                       the harness (agent/gdrive_tool.py) permanently.
+#
+# THE TOOLS GATEWAY IS THEREFORE ASYMMETRIC BY NECESSITY, and that asymmetry is
+# documented rather than hidden. agent.py's SOURCES table carries a `via` axis
+# (GATEWAY | IN_PROCESS) precisely so this is a per-source data fact instead of a
+# special case buried in control flow.
+#
+# ─────────────────────────────────────────────────────────────────────────────────
+# WHAT THIS TEMPLATE DELIBERATELY DOES NOT DO.
+# ─────────────────────────────────────────────────────────────────────────────────
+# It does not create the M3 MCP server (no such server exists — its blocker is an
+# AgentCore Identity capability gap: it performs one hop and cannot request an ID-JAG).
+# It does not create the GitHub credential provider — 02-runtime.yaml owns that, and
+# duplicating it would issue a second callback URL and silently break user consent.
+# It does not enable Google Drive; see the M2 note above.
+
+Parameters:
+  RuntimeStackName:
+    Type: String
+    Default: ripple-runtime
+    Description: >
+      Stack name of 02-runtime.yaml. This stack IMPORTS the runtime ARN, the endpoint
+      name and the GitHub credential provider ARN from it, so 02 must be deployed
+      first AND must export them (it does, as of the same change that added this file).
+
+  AgentName:
+    Type: String
+    Default: ripple
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+
+  ProjectTagValue:
+    Type: String
+    Default: ripple_slack_assistant
+
+  # ---- Inbound auth (both gateways) ----
+  Auth0Domain:
+    Type: String
+    Description: e.g. dev-xxxx.us.auth0.com (no scheme, no trailing slash).
+  Auth0Audience:
+    Type: String
+    Description: >
+      The allowed JWT audience. DELIBERATELY THE SAME VALUE AS THE RUNTIME'S — see
+      the IngressGateway comment on why a tightly-scoped `aud` is load-bearing under
+      JWT_PASSTHROUGH rather than merely tidy.
+
+  ConsentReturnUrl:
+    Type: String
+    Default: 'http://localhost:8799/consent'
+    Description: >
+      MUST BE THE SAME VALUE 02-runtime.yaml receives, and for the same reason — see
+      that template's ConsentReturnUrl parameter for the full explanation of why this
+      has to be a URL OUR OWN CODE SERVES (it receives ?session_id=... and the token is
+      vaulted only when the app then calls CompleteResourceTokenAuth). Required here
+      because GithubTarget's grant type is AUTHORIZATION_CODE, which the service
+      rejects without it. scripts/deploy.py passes the single source of truth
+      (client/consent.py CONSENT_RETURN_URL) to both stacks, so they cannot drift.
+
+  GithubScopes:
+    Type: String
+    Default: 'repo read:org'
+    Description: >
+      Must be a SUBSET of (ideally equal to) the scopes 02-runtime.yaml passed to the
+      credential provider. The gateway target requests these at token-fetch time; asking
+      for a scope the OAuth app was never granted fails at call time, not deploy time.
+
+  GithubClientSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      MUST BE THE SAME VALUE 02-runtime.yaml receives. Not used to CREATE anything here
+      — 02 owns the credential provider — only to GRANT THIS STACK'S ROLE A READ on it.
+      #
+      This is a non-obvious consequence of 02 choosing ClientSecretSource=EXTERNAL.
+      Under EXTERNAL the OAuth client secret lives in a secret WE own, and AgentCore
+      Identity reads it AS THE CALLING PRINCIPAL rather than as a service principal. So
+      the read happens once per caller identity, and every caller needs its own grant:
+      the runtime role has one (02's ReadGithubClientSecret statement), and the GATEWAY
+      role needs the identical one the moment a gateway target fetches an outbound
+      GitHub token. Leaving it empty deploys cleanly and then fails on the first tool
+      call with, verbatim:
+      #
+        Failed to fetch outbound oauth token. Access denied when retrieving the
+        provided secret '<arn>'. User: .../RipplerippleGatewayRole/gateway-session-...
+        is not authorized to perform: secretsmanager:GetSecretValue
+      #
+      — observed, and only legible because ExceptionLevel=DEBUG was on; without it the
+      gateway returns "An internal error occurred. Please retry later."
+      #
+      Empty is correct only when 02 ran with ClientSecretSource=MANAGED, where the
+      service owns the secret and no caller-side grant exists to mirror.
+      scripts/deploy.py passes GITHUB_CLIENT_SECRET_ARN to both stacks from one
+      variable, so the two cannot drift.
+
+  # ---- M3 (off by default) ----
+  McpServerEndpoint:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL, and EMPTY ON PURPOSE. HTTPS endpoint of the token-exchange-guarded MCP
+      server. Setting it creates the M3 target. Left empty the target is not created at
+      all, which is the honest state: no such server is deployed, and the mechanism it
+      would use is blocked on an AgentCore capability gap (OI-14) rather than on us.
+      Requires McpServerProviderArn to be set as well.
+  McpServerProviderArn:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. ARN of a CustomOauth2 credential provider carrying
+      onBehalfOfTokenExchangeConfig. NOT created here: it needs a client secret, and
+      secrets do not belong in CloudFormation. Create it out of band, pass the ARN.
+
+  ExceptionLevel:
+    Type: String
+    Default: ''
+    AllowedValues: ['', 'DEBUG']
+    Description: >
+      DEBUG makes the gateway return upstream error detail instead of a generic
+      failure. Genuinely useful while wiring a target up — an opaque failure here is
+      expensive to diagnose. Leave EMPTY outside development: it surfaces upstream
+      responses to callers.
+
+Conditions:
+  # Both M3 parameters or neither. A half-configured M3 target would deploy and then
+  # fail at call time, which is the failure mode this pair of conditions exists to
+  # prevent — the Rules block below turns it into a deploy-time error instead.
+  UseMcpServerTarget: !And
+    - !Not [!Equals [!Ref McpServerEndpoint, '']]
+    - !Not [!Equals [!Ref McpServerProviderArn, '']]
+  UseExceptionLevel: !Not [!Equals [!Ref ExceptionLevel, '']]
+  # Mirrors 02-runtime.yaml's identically-named condition, for the same reason: under
+  # ClientSecretSource=MANAGED there is no customer-owned secret to grant a read on,
+  # and granting one against an empty or unrelated ARN would be both invalid and wrong.
+  UseExternalSecret: !Not [!Equals [!Ref GithubClientSecretArn, '']]
+
+Rules:
+  McpTargetNeedsBothValues:
+    RuleCondition: !Or
+      - !Not [!Equals [!Ref McpServerEndpoint, '']]
+      - !Not [!Equals [!Ref McpServerProviderArn, '']]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref McpServerEndpoint, '']]
+          - !Not [!Equals [!Ref McpServerProviderArn, '']]
+        AssertDescription: >
+          McpServerEndpoint and McpServerProviderArn must be set together. An endpoint
+          with no credential provider cannot authenticate, and a provider with no
+          endpoint has nothing to reach — either alone deploys cleanly and then fails
+          on the first tool call.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Gateway execution role. ONE role, both gateways — they need disjoint
+  # permissions, but splitting them would double the IAM surface for no isolation
+  # benefit: both gateways are equally trusted components of the same agent.
+  # ---------------------------------------------------------------------------
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Ripple${AgentName}GatewayRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      Policies:
+        - PolicyName: RippleGatewayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # INGRESS ONLY: invoke the runtime it fronts. Scoped to this runtime,
+              # not runtime/* — the ingress gateway has exactly one target and any
+              # broader grant would let it reach unrelated agents in this account.
+              - Sid: InvokeRuntime
+                Effect: Allow
+                Action: 'bedrock-agentcore:InvokeAgentRuntime'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${RuntimeStackName}-RuntimeArn'
+                  # The endpoint is a separate ARN shape and is what a qualified
+                  # invoke actually targets; granting only the runtime ARN produces
+                  # AccessDenied naming the endpoint.
+                  - !Sub
+                    - '${Arn}/runtime-endpoint/*'
+                    - Arn: !ImportValue
+                        'Fn::Sub': '${RuntimeStackName}-RuntimeArn'
+              # TOOLS ONLY: fetch the outbound source credential from the vault.
+              # Same two-resource-type quirk documented in 02-runtime.yaml's
+              # OAuth2TokenAccess statement — the call authorizes against BOTH the
+              # token vault and the calling workload identity, and IAM does not
+              # combine statements, so both ARNs must appear here together.
+              - Sid: OAuth2TokenAccess
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetResourceOauth2Token'
+                  - 'bedrock-agentcore:GetWorkloadAccessToken'
+                  - 'bedrock-agentcore:GetWorkloadAccessTokenForJWT'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*'
+              # TOOLS ONLY, and the one grant on this role that is NOT obvious from
+              # reading the gateway's configuration — because the resource it names is
+              # created by a DIFFERENT stack and never appears in this one.
+              #
+              # GetResourceOauth2Token above is necessary but NOT sufficient. To mint an
+              # outbound GitHub token, AgentCore Identity must first read the OAuth
+              # CLIENT secret, and 02-runtime.yaml chose ClientSecretSource=EXTERNAL —
+              # so that secret is ours, in Secrets Manager, and the read is performed
+              # WITH THE CALLER'S CREDENTIALS. 02 grants it to the runtime role; the
+              # same grant has to exist here, verbatim, or the first tool call fails
+              # with AccessDenied naming this role's gateway-session (see the
+              # GithubClientSecretArn parameter for the exact message).
+              #
+              # Two roles reading one secret is the intended shape of EXTERNAL, not a
+              # leak: both are execution roles of the same agent, and the alternative —
+              # MANAGED — hands secret ownership to the service and gives up the
+              # rotation and audit story that motivated EXTERNAL in the first place.
+              # Scoped to the ONE ARN, never secretsmanager:*.
+              - !If
+                - UseExternalSecret
+                - Sid: ReadGithubClientSecret
+                  Effect: Allow
+                  Action: 'secretsmanager:GetSecretValue'
+                  Resource: !Ref GithubClientSecretArn
+                - !Ref 'AWS::NoValue'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/gateways/*'
+              - Sid: Telemetry
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'   # no resource-level scoping available for these
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
+  # ---------------------------------------------------------------------------
+  # INGRESS GATEWAY — the secured front door (an HTTP gateway, not an MCP server).
+  # ---------------------------------------------------------------------------
+  # ⚠️ THIS IS THE DELIBERATE DEVIATION FROM AWS'S WRITTEN RECOMMENDATION, and it is
+  # recorded here rather than in a side document because this is where someone will
+  # question it.
+  #
+  # AWS states that JWT_PASSTHROUGH is "not the recommended approach for production"
+  # and recommends an on-behalf-of exchange instead. We use passthrough anyway. The
+  # reason is concrete, not stylistic: an exchanged token would carry `aud` = the
+  # runtime and is NOT guaranteed to carry `email` / `email_verified`. Those two claims
+  # are exactly what agent/identity_claims.py requires to name a Google impersonation
+  # subject (M2's GATE 1 and GATE 2). Exchanging at ingress would therefore SILENTLY
+  # DISABLE every delegated source — the agent would authenticate fine and then fail to
+  # resolve a subject, which reads as "Drive is broken" and not as "ingress changed".
+  #
+  # Passthrough was designed here with two mitigations. The first works. The second
+  # DOES NOT WORK in this configuration, and that is a measured result, not a caveat:
+  #
+  #   (1) A TIGHTLY-SCOPED `aud`. AllowedAudience is the same single audience the
+  #       runtime accepts. Under passthrough the gateway forwards the caller's token
+  #       verbatim, so the audience check is the ONLY thing preventing a token minted
+  #       for some other API in the same tenant from being replayed here. This is in
+  #       force, and it is currently the ONLY control on the ingress path.
+  #
+  #   (2) GATEWAY-BYPASS PREVENTION — INTENDED, IMPLEMENTED, AND CURRENTLY DISABLED.
+  #       ⚠️ THE BYPASS IS OPEN BY DESIGN DECISION, NOT BY OVERSIGHT. Read this before
+  #       "fixing" it by setting IngressGatewayArn.
+  #
+  #       The intent: passthrough means the runtime keeps accepting the same tokens the
+  #       gateway accepts, so a caller who knows the runtime ARN can skip the gateway
+  #       and every gateway-side control with it. AWS's documented closure for a
+  #       CUSTOM_JWT runtime is AllowedWorkloadConfiguration on the runtime's
+  #       authorizer, naming this gateway — "the gateway stamps the source of every
+  #       request it forwards, and the runtime validates that source on the way in"
+  #       (gateway-target-http-runtime.html). 02-runtime.yaml implements exactly that,
+  #       parameterised as IngressGatewayArn.
+  #
+  #       WHAT ACTUALLY HAPPENS. With IngressGatewayArn set, BOTH paths return 401:
+  #
+  #         {"jsonrpc":"2.0","error":{"code":-32001,"message":"Transaction token
+  #          required: authorizer has AllowedWorkloadConfiguration configured"}}
+  #
+  #       — the gateway path too, which is the path the restriction exists to permit.
+  #       The control does not narrow access to the gateway; it closes the runtime to
+  #       everyone. Verified by single-variable isolation: a CFN update setting ONLY
+  #       IngressGatewayArn='' (every other parameter UsePreviousValue) turns the
+  #       gateway path into a 200 with a full agent answer; restoring the ARN returns
+  #       both paths to 401.
+  #
+  #       WHY. ⚠️ THE CAUSE IS THE OUTBOUND CREDENTIAL TYPE, NOT THE FIELD. This was
+  #       established by experiment and it is the useful part of this comment:
+  #
+  #         A JWT_PASSTHROUGH TARGET NEVER MINTS A WAT, SO IT NEVER STAMPS THE CHAIN.
+  #
+  #       An identical throwaway gateway differing in ONE property — OAUTH outbound
+  #       instead of JWT_PASSTHROUGH — DOES stamp it. Proof, with the restriction
+  #       pointed at that probe gateway: the probe returns a BARE 401 with an EMPTY
+  #       body, NOT "Transaction token required", while the direct path and the
+  #       passthrough ingress path both return the "Transaction token required" 401 in
+  #       the same run. A different error means the workload check PASSED and the
+  #       request was rejected later, on the token itself — the probe forwards a GitHub
+  #       access token where the runtime expects an Auth0 JWT. CloudTrail confirms the
+  #       mechanism: GetWorkloadAccessTokenForJWT (the WAT mint) fires for the OAUTH
+  #       probe and never for the passthrough ingress target, which has no outbound
+  #       credential to fetch and so never calls AgentCore Identity at all.
+  #
+  #       So AWS's "the gateway stamps the source of every request it forwards" holds
+  #       for OAUTH outbound and NOT for JWT_PASSTHROUGH. The two features are
+  #       incompatible as configured here; the docs do not say so.
+  #
+  #       ⚠️ HOW TO TEST THIS CORRECTLY — a method error cost real time here. A raw
+  #       UpdateAgentRuntime creates a NEW VERSION and does NOT move the endpoint, so
+  #       the `live` qualifier keeps serving the OLD version and every probe silently
+  #       measures the previous configuration. CloudFormation moves the endpoint;
+  #       boto3 does not. Always assert the endpoint's liveVersion equals the version
+  #       you just wrote (GetAgentRuntimeEndpoint) BEFORE believing a result, or call
+  #       UpdateAgentRuntimeEndpoint yourself. An earlier claim in this comment that
+  #       `workloadIdentities` had been ruled out was an artifact of exactly this and
+  #       has been withdrawn: that form was never actually live.
+  #
+  #       WHAT WAS RULED OUT, so nobody re-runs these:
+  #         • A policy session. Sending x-amzn-bedrock-agentcore-policy-session-id on
+  #           the request (the header that makes a gateway establish a session, and so
+  #           a plausible trigger for minting a WAT) changes nothing.
+  #         • Propagation delay. Re-tested well after the update reached READY.
+  #         • Wrong value type. HostingEnvironment.Arn is documented as a gateway ARN,
+  #           and GetAgentRuntime confirms the service stored exactly the ARN we sent.
+  #         • GATEWAY_IAM_ROLE outbound. Rejected by the runtime with 403
+  #           "Authorization method mismatch" — it signs SigV4 and this runtime is
+  #           CUSTOM_JWT. It would also defeat the purpose: the runtime would see the
+  #           gateway's identity, not the caller's.
+  #         • NOT `workloadIdentities` vs `hostingEnvironments`. Both introspect the
+  #           same chain, and with no chain stamped neither can succeed. Untested-live
+  #           per the method note above, and there is no longer a reason to test it.
+  #
+  #       THE OPEN QUESTION, and it is now a DESIGN TRADE rather than a mystery: switch
+  #       the ingress target to OAUTH outbound (the AWS-recommended on-behalf-of
+  #       exchange) and
+  #       the bypass closes. The cost is the deviation argued at the top of this
+  #       comment — an exchanged token is not guaranteed to carry `email` /
+  #       `email_verified`, which M2's GATE 1 and GATE 2 need to name a Google
+  #       impersonation subject, so it may buy the bypass control by silently disabling
+  #       every delegated source. That objection is a property of the IDP'S TOKEN
+  #       CONFIGURATION, not a protocol law: an IdP that emits `email` in the exchanged
+  #       token dissolves it. Unverified on the current Auth0 dev tenant, and it also
+  #       needs a credential provider whose audience is the RUNTIME rather than GitHub,
+  #       which does not exist yet. Sequenced deliberately: M2 is switched off today
+  #       (GOOGLE_SA_SECRET_ARN unset), so this trade can be made cheaply the moment
+  #       someone needs the bypass closed more than they need Drive.
+  #
+  #       This is NOT Okta Cross-App Access / ID-JAG, and conflating them wastes a week:
+  #       the WAT is an AWS-signed opaque token carrying an AgentCore service chain, not
+  #       an IdP token, so no ID-JAG or tenant feature can supply one. XAA is relevant
+  #       to M3 ONLY, where it is separately blocked because AgentCore Identity has no
+  #       `requested_token_type`, so it cannot request an ID-JAG at all.
+  #
+  #       THE DECISION. IngressGatewayArn is left EMPTY and the bypass is documented
+  #       rather than closed with a workaround. The alternative — shipping a runtime
+  #       that 401s on every path — is not a security posture, it is an outage. This is
+  #       the same shape as the M2 gateway limitation above: a capability gap is
+  #       recorded where the reader will look for it, not hidden behind a config value
+  #       that looks optional. If a future service change makes the ingress gateway
+  #       stamp the chain, the fix is one parameter — pass IngressGatewayArn — and the
+  #       verification is the two-line both-paths test described above: the gateway path
+  #       must return 200 and the direct path must return 401.
+  IngressGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${AgentName}-ingress'
+      Description: Ripple ingress — validates the end user's IdP JWT, forwards it unchanged.
+      RoleArn: !GetAtt GatewayRole.Arn
+      # ⚠️ ProtocolType IS DELIBERATELY ABSENT, and ProtocolConfiguration with it. See
+      # the header: an MCP gateway REFUSES the Http.AgentcoreRuntime target below, so
+      # adding `ProtocolType: MCP` here — which looks like a harmless tidy-up, and which
+      # the CFN schema's `default: MCP` actively invites — breaks this stack at CREATE.
+      # There is correspondingly no SupportedVersions to pin: MCP protocol versions are
+      # a property of an MCP gateway, and this one does not speak MCP. The version pin
+      # lives on ToolsGateway below, where it applies.
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://${Auth0Domain}/.well-known/openid-configuration'
+          # Mitigation (1) above. Not merely mirroring the runtime for neatness.
+          AllowedAudience: [!Ref Auth0Audience]
+      ExceptionLevel: !If [UseExceptionLevel, !Ref ExceptionLevel, !Ref 'AWS::NoValue']
+      Tags: {project_name: !Ref ProjectTagValue}
+
+  # The runtime, fronted directly. Reachable at
+  # <IngressGatewayUrl>/<this target's Name>/invocations — i.e. the target NAME below is
+  # part of the public URL, so renaming it is a breaking change for callers.
+  #
+  # CredentialProviderType JWT_PASSTHROUGH is what makes agent.py's
+  # `_caller_jwt(context)` keep working unchanged: the agent still reads the END USER's
+  # token out of the Authorization header, exactly as it does on the direct path. Any
+  # other credential type here would replace that token and break both the M1 vault
+  # lookup (keyed by the user's identity) and M2's claim gates. GATEWAY_IAM_ROLE, which
+  # the AWS examples use for this target type, would do exactly that: the runtime would
+  # see the gateway's identity instead of the caller's, and every per-user source would
+  # resolve to the wrong vault entry or to none.
+  IngressRuntimeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt IngressGateway.GatewayIdentifier
+      Name: !Sub '${AgentName}-runtime'
+      Description: The Ripple agent runtime.
+      TargetConfiguration:
+        Http:
+          AgentcoreRuntime:
+            Arn: !ImportValue
+              'Fn::Sub': '${RuntimeStackName}-RuntimeArn'
+            # Pin to the same named endpoint 02-runtime.yaml publishes, so the
+            # gateway follows version rolls instead of pinning to v1 — the same trap
+            # documented at length on that template's RuntimeEndpoint.
+            Qualifier: !ImportValue
+              'Fn::Sub': '${RuntimeStackName}-EndpointName'
+            # Schema is intentionally OMITTED. It is optional, and the runtime's
+            # contract is a single {"prompt": ...} POST that the service derives
+            # correctly. Supplying a hand-written OpenAPI document here would be a
+            # second, drift-prone copy of a contract that already lives in agent.py.
+      CredentialProviderConfigurations:
+        - CredentialProviderType: JWT_PASSTHROUGH
+
+  # ---------------------------------------------------------------------------
+  # TOOLS GATEWAY — holds the OUTBOUND source credentials.
+  # ---------------------------------------------------------------------------
+  # Inbound auth is the same CUSTOM_JWT configuration as the ingress. That is not
+  # copy-paste: the caller here is the AGENT, which reaches this gateway carrying the
+  # end user's token (that is what makes per-user M1 lookups resolve to the right
+  # vault entry). Same issuer, same audience, therefore same authorizer.
+  ToolsGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${AgentName}-tools'
+      Description: Ripple tools — holds each source's outbound credential.
+      RoleArn: !GetAtt GatewayRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://${Auth0Domain}/.well-known/openid-configuration'
+          AllowedAudience: [!Ref Auth0Audience]
+      ProtocolConfiguration:
+        Mcp:
+          # ⚠️ PINNED DELIBERATELY, and this is the ONLY gateway that can carry the pin —
+          # the ingress gateway speaks no MCP, so it has no SupportedVersions to set (see
+          # the comment on its ProtocolType). A gateway created WITHOUT this list serves
+          # 2025-03-26 to any client that omits the MCP-Protocol-Version header, so the
+          # pin is what makes the negotiated version predictable rather than incidental.
+          # 2025-11-25 is what mcp==1.28.1 in requirements.txt advertises as its latest,
+          # so the client negotiates without a downgrade.
+          #
+          # Two traps if this list is ever edited. UpdateGateway REPLACES the array rather
+          # than appending, so send the complete desired list or a version some client
+          # still uses is silently dropped. And version translation does not cover
+          # elicitation or sampling, so a 2025-* client calling a 2026-* server tool that
+          # needs either fails with -32021 — roll clients forward BEFORE removing an old
+          # version. Changing this touches neither the inbound authorizer nor the outbound
+          # OAuth credential provider, so the per-user GitHub token flow is unaffected.
+          SupportedVersions: ['2025-11-25', '2026-07-28']
+          Instructions: >
+            Ripple knowledge sources. Every tool here runs as the calling end user, so
+            results are already trimmed to that user's permissions. Call
+            github_list_orgs before github_search_code to build a scoped query.
+      ExceptionLevel: !If [UseExceptionLevel, !Ref ExceptionLevel, !Ref 'AWS::NoValue']
+      Tags: {project_name: !Ref ProjectTagValue}
+
+  # ---------------------------------------------------------------------------
+  # M1 CONSENT — GitHub, as an OpenAPI target.
+  # ---------------------------------------------------------------------------
+  # ⚠️ WHY THIS TARGET EXPOSES **TWO** OPERATIONS AND NOT JUST SEARCH.
+  # This is the one genuinely subtle thing in this file, and it is a correctness
+  # requirement rather than a preference.
+  #
+  # agent/github_tool.py `_search_scope()` (see its comment at the top) prefixes every
+  # search with `user:<login>` and `org:<name>` qualifiers. WITHOUT THEM, GitHub code
+  # search returns global public results and the agent cited `awesome-flipperzero`,
+  # `FlagAI` and `learnxinyminutes-docs` for internal questions — verified, not
+  # hypothetical. Relevance scoping is therefore load-bearing.
+  #
+  # But building those qualifiers takes TWO chained calls: list the caller's orgs,
+  # THEN compose the query. A gateway target is a single call per tool — it cannot
+  # chain, and it cannot know the user's orgs a priori. So a naive one-tool
+  # "search GitHub" target would SILENTLY LOSE the scoping and quietly regress answer
+  # quality in a way no unit test would catch.
+  #
+  # Resolution: expose both primitives and let the AGENT compose them. The gateway
+  # keeps what it is good at (holding the credential, running as the user); the agent
+  # keeps what it is good at (orchestration). agent/github_tool.py's `_search_scope`
+  # logic is preserved and simply sources its org list over MCP instead of over
+  # requests. The composition rule is stated in the gateway Instructions above so an
+  # LLM reading the tool list is told the ordering, not left to infer it.
+  GithubTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt ToolsGateway.GatewayIdentifier
+      Name: github
+      Description: GitHub code search and org listing, running as the calling user.
+      TargetConfiguration:
+        Mcp:
+          OpenApiSchema:
+            # Inline rather than S3: this is ~80 lines describing three operations, and
+            # an S3 object would add a deploy-order dependency plus a second place to
+            # look. Trimmed to exactly the three operations used — GitHub's full OpenAPI
+            # document is megabytes and would expose hundreds of unintended tools.
+            #
+            # ⚠️ `/user` IS LOAD-BEARING, NOT A CONVENIENCE. It was omitted at first, on
+            # the reasoning that org repos are what a company assistant wants; the
+            # `/search/code` summary below still says the query MUST carry a `user:` or
+            # `org:` qualifier, and with only `/user/orgs` here there was no way to
+            # obtain the `user:` half. For an account in NO orgs that computed an EMPTY
+            # scope, and github_tool._search_scope's documented failure returned in full:
+            # the first live gateway search cited `crestalnetwork/intentkit`,
+            # `vaquarkhan/vaquarkhan` and `RuntimeTools/appmetrics` — strangers' public
+            # repositories, correctly permission-trimmed and useless. Exactly the class
+            # of silent regression that module's ⚠️ warns a gateway target can cause,
+            # observed rather than predicted. The in-process route never had the bug
+            # because it calls GET /user directly.
+            InlinePayload: |
+              {
+                "openapi": "3.0.3",
+                "info": {"title": "GitHub (Ripple subset)", "version": "1.0.0"},
+                "servers": [{"url": "https://api.github.com"}],
+                "paths": {
+                  "/user": {
+                    "get": {
+                      "operationId": "github_get_user",
+                      "summary": "Get the calling user's own login. Call this FIRST, together with the org list, to build a scoped search query.",
+                      "responses": {
+                        "200": {
+                          "description": "The authenticated user",
+                          "content": {
+                            "application/json": {
+                              "schema": {
+                                "type": "object",
+                                "properties": {"login": {"type": "string"}}
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "/user/orgs": {
+                    "get": {
+                      "operationId": "github_list_orgs",
+                      "summary": "List the organizations the calling user belongs to. Call this FIRST, then use the names to build a scoped search query.",
+                      "responses": {
+                        "200": {
+                          "description": "Organizations",
+                          "content": {
+                            "application/json": {
+                              "schema": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {"login": {"type": "string"}}
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "/search/code": {
+                    "get": {
+                      "operationId": "github_search_code",
+                      "summary": "Search code the calling user can access. The q parameter MUST include user: or org: qualifiers, otherwise results are global public repositories and will be irrelevant.",
+                      "parameters": [
+                        {
+                          "name": "q",
+                          "in": "query",
+                          "required": true,
+                          "schema": {"type": "string"},
+                          "description": "Search query. MUST be scoped, e.g. 'retry logic org:my-org user:my-login'."
+                        },
+                        {
+                          "name": "per_page",
+                          "in": "query",
+                          "required": false,
+                          "schema": {"type": "integer", "default": 10, "maximum": 100}
+                        }
+                      ],
+                      "responses": {
+                        "200": {
+                          "description": "Search results",
+                          "content": {
+                            "application/json": {
+                              "schema": {
+                                "type": "object",
+                                "properties": {
+                                  "total_count": {"type": "integer"},
+                                  "items": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "name": {"type": "string"},
+                                        "path": {"type": "string"},
+                                        "html_url": {"type": "string"},
+                                        "repository": {
+                                          "type": "object",
+                                          "properties": {"full_name": {"type": "string"}}
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+      CredentialProviderConfigurations:
+        - CredentialProviderType: OAUTH
+          CredentialProvider:
+            OauthCredentialProvider:
+              # THE SAME provider 02-runtime.yaml created — imported, never redeclared.
+              # Creating a second GitHub provider here would issue a NEW callback URL
+              # and break every existing user's consent until it was pasted into the
+              # GitHub OAuth App. That failure is invisible until a user tries to auth.
+              ProviderArn: !ImportValue
+                'Fn::Sub': '${RuntimeStackName}-GithubProviderArn'
+              Scopes: !Split [' ', !Ref GithubScopes]
+              # M1 CONSENT. The user approves once; AgentCore vaults the refresh token
+              # and the gateway fetches an access token per call from then on.
+              GrantType: AUTHORIZATION_CODE
+              # REQUIRED whenever GrantType is AUTHORIZATION_CODE — omitting it fails at
+              # CREATE with "Default return URL is required when grant type is
+              # AUTHORIZATION_CODE" (observed). It is the same
+              # browser-lands-here-after-consent URL 02-runtime.yaml documents at length
+              # on its ConsentReturnUrl parameter, and it must stay THE SAME VALUE: a
+              # different URL here would send users consenting via the gateway to a page
+              # that never calls CompleteResourceTokenAuth, so their token would never
+              # be vaulted and the session would sit IN_PROGRESS forever.
+              DefaultReturnUrl: !Ref ConsentReturnUrl
+
+  # ---------------------------------------------------------------------------
+  # M3 TOKEN EXCHANGE — the guarded MCP server. NOT CREATED BY DEFAULT.
+  # ---------------------------------------------------------------------------
+  # Conditional because no such server exists yet, and per FR-41 no source is
+  # documented or deployed as being on M3 until its authorization server is verified
+  # to accept the exchange. The 2026-08-07 spike found the blocker is upstream of us:
+  # AgentCore Identity cannot request an ID-JAG at all, so the Okta Cross-App Access
+  # shape this target was designed for is not reachable yet (OI-14).
+  #
+  # It is written out in full anyway, and that is the point of FR-34: when the
+  # capability lands, M3 becomes TWO PARAMETER VALUES rather than a code change.
+  McpServerTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: UseMcpServerTarget
+    Properties:
+      GatewayIdentifier: !GetAtt ToolsGateway.GatewayIdentifier
+      Name: guarded-mcp
+      Description: Token-exchange-guarded MCP server (M3).
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Ref McpServerEndpoint
+      CredentialProviderConfigurations:
+        - CredentialProviderType: OAUTH
+          CredentialProvider:
+            OauthCredentialProvider:
+              ProviderArn: !Ref McpServerProviderArn
+              Scopes: []
+              # M3. The one place TOKEN_EXCHANGE appears in this repo's infrastructure.
+              GrantType: TOKEN_EXCHANGE
+
+Outputs:
+  IngressGatewayArn:
+    Description: >
+      ⚠️ DO NOT FEED THIS BACK INTO 02-runtime.yaml as IngressGatewayArn WHILE THIS
+      GATEWAY'S TARGET IS ON JWT_PASSTHROUGH. Doing so 401s every path, this gateway's
+      included: a passthrough target never mints the WAT, so it never stamps the workload
+      identity chain that authorizer field introspects, and no value of the field can be
+      satisfied. This is a property of the OUTBOUND CREDENTIAL TYPE, not of the field or
+      of this ARN — an otherwise-identical gateway on OAUTH outbound DOES stamp it and
+      DOES pass the check. So this export is the right value; it is the target config
+      that has to change first. Evidence, the method error that nearly hid it, and the
+      claim trade-off that gates the switch are on the IngressGateway resource above,
+      mitigation (2).
+    Value: !GetAtt IngressGateway.GatewayArn
+    Export:
+      Name: !Sub '${AWS::StackName}-IngressGatewayArn'
+  IngressGatewayUrl:
+    Description: >
+      Base URL of the ingress gateway. NOT an MCP endpoint (this gateway has no protocol
+      type — see the header): invoke the agent at
+      <this value>/<AgentName>-runtime/invocations with the same {"prompt": ...} body
+      client/ask.py sends to the runtime directly.
+    Value: !GetAtt IngressGateway.GatewayUrl
+  IngressGatewayIdentifier:
+    Value: !GetAtt IngressGateway.GatewayIdentifier
+  ToolsGatewayArn:
+    Value: !GetAtt ToolsGateway.GatewayArn
+    Export:
+      Name: !Sub '${AWS::StackName}-ToolsGatewayArn'
+  ToolsGatewayUrl:
+    Description: >
+      Set as RIPPLE_TOOLS_GATEWAY_URL for the agent. agent.py reads it to reach every
+      source whose SOURCES row is `via: GATEWAY`; absent, those rows fall back to
+      in-process so the agent still runs locally with no gateway deployed.
+    Value: !GetAtt ToolsGateway.GatewayUrl
+  ToolsGatewayIdentifier:
+    Value: !GetAtt ToolsGateway.GatewayIdentifier
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn

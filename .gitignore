@@ -12,6 +12,9 @@ client/.token.json
 __pycache__/
 *.py[cod]
 
+# macOS Finder metadata
+.DS_Store
+
 # Starter-toolkit state. Still ignored: it is machine-local (absolute paths,
 # account id, a runtime id from one deploy) and the CloudFormation path does not
 # read it. Safe to delete once the toolkit is uninstalled.

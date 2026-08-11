@@ -25,7 +25,7 @@ IdP device-code login  ->  user JWT
          every source available to this user: search (content), read (one
          document's full text), list (what they can access)
          |
-         |-- OBO FLOW, no consent screen ever (Google Drive):
+         |-- DELEGATION FLOW, no consent screen ever (Google Drive):
          |     the verified `email` claim becomes the subject of a service-account
          |     assertion, and Google returns a token scoped to THAT ONE USER
          |
@@ -43,12 +43,12 @@ Either way the *source* does the trimming. See
 
 | Path | What it is |
 |---|---|
-| `agent/` | The agent that runs in the container: `agent.py` (entrypoint + the `SOURCES` table, the extension point, + the three tools), `github_tool.py` (`search_github`, `fetch_document`, `list_sources` — the consent flow), `gdrive_tool.py` (the same three over Drive — the OBO flow), `identity_claims.py` (re-verifies the JWT signature and gates which email may be impersonated; the OBO flow's whole safety argument) |
-| `client/` | CLI test client: `login.py` (Auth0 device flow), `ask.py` (invoke the runtime), `consent.py` (completes 3-legged OAuth — owns the return URL both the runtime and the allowlist derive from) |
-| `infra/` | CloudFormation templates, architecture docs, diagrams + their renderers |
+| `agent/` | The agent that runs in the container: `agent.py` (entrypoint + the `SOURCES` table, the extension point, + the three tools), `github_tool.py` (`search_github`, `fetch_document`, `list_sources` — the consent flow), `gdrive_tool.py` (the same three over Drive — the delegation flow), `identity_claims.py` (re-verifies the JWT signature and gates which email may be impersonated; the delegation flow's whole safety argument), `gateway_tool.py` (calls a source through the tools Gateway instead of in-process, for a source set to `<KEY>_VIA=GATEWAY`) |
+| `client/` | CLI test client: `login.py` (Auth0 device flow; `--copy` puts the JWT on the clipboard for the Harness playground), `ask.py` (invoke the runtime), `consent.py` (completes 3-legged OAuth — owns the return URL both the runtime and the allowlist derive from) |
+| `infra/` | CloudFormation templates, architecture docs, diagrams + their renderers. `01-foundation` → `02-runtime` are the deploy; `03-gateways` and `04-harness` are opt-in and **additive** — `04` is a second, parallel managed agent, not a replacement for `02` |
 | `scripts/` | Deploy path: `deploy.py` (orchestrator) → `cfn_build.py` (image) → `apply_tags.py`, plus `register_consent_url.py` (allowlists the consent return URL — CFN can't) and `verify_drive_delegation.py` (proves the Google admin grant works with no Ripple code in the path). `create_github_provider.py` is a standalone leftover — CloudFormation creates the provider now, so the Quickstart never calls it |
-| `tests/` | `test_identity_claims.py` — the regression tests on the impersonation gates. Run with `python3 tests/test_identity_claims.py`; no AWS or network needed |
-| `docs/` | Setup guides: `SETUP.md` (Auth0 front-door identity), `DATA-SOURCES.md` (onboarding every source — GitHub, Google Drive, and the three target-state MCP sources), `GOOGLE-DRIVE-OKTA-SETUP.md` (the Drive deep dive), `FUTURE-MULTI-AGENT.md` (roadmap) |
+| `tests/` | `test_identity_claims.py` — the regression tests on the impersonation gates; `test_caller_identity.py` — that identity comes from the authenticated header and never from the body; `test_gateway_elicitation.py` — that a tools-Gateway consent prompt survives the anyio `ExceptionGroup` with its URL intact and is sorted as "the user must act", not "an operator must act"; `test_harness_prompt.py` — that the system prompt duplicated into `04-harness.yaml` still carries every grounding rule, and that the harness keeps no shell and no shared memory partition. Run each directly (`python3 tests/test_identity_claims.py`); no AWS or network needed, and no pytest |
+| `docs/` | Setup guides: `SETUP.md` (Auth0 front-door identity), `DATA-SOURCES.md` (onboarding every source — GitHub, Google Drive, and the three target-state MCP sources), `GOOGLE-DRIVE-OKTA-SETUP.md` (the Drive deep dive), `HARNESS-ASSESSMENT.md` (why the managed harness can't be the primary agent yet — measured), `FUTURE-MULTI-AGENT.md` (roadmap) |
 | `Dockerfile` | The container image. **Committed source**, not generated — `cfn_build.py` needs it |
 | `requirements.txt` | Container dependencies only |
 | `requirements-dev.txt` | Your machine: deploy + client + diagram rendering |
@@ -65,18 +65,18 @@ signed-in user may read — but they reach it by different mechanisms, and they 
 completely different to use. That difference is the point of having both, so it is
 worth being precise about it before setup.
 
-`infra/architecture-components.png` draws them side by side: the **OBO flow** in
+`infra/architecture-components-v3.png` draws them side by side: the **delegation flow** in
 green (steps `1a`–`14a`), the **consent flow** in orange (`1b`–`14b`, plus the
 `★` arrow). Steps `1`–`5` are identical in both; they diverge at step `6`.
 
 Each flow also has a sequence diagram to itself, which is where the shape of the
-difference is easiest to see: `infra/architecture-obo-flow.png` (17 edges, one
+difference is easiest to see: `infra/architecture-delegation-flow.png` (17 edges, one
 invocation, no consent screen on the canvas) and `infra/architecture-consent-flow.png`
 (26 edges, two invocations, because the human step in the middle is one the runtime
 will not hold a request open for). Those two diagrams number their own flow from `1`
 independently of the components diagram and of each other.
 
-| | OBO flow (green, `…a`) | Consent flow (orange, `…b`) |
+| | Delegation flow (green, `…a`) | Consent flow (orange, `…b`) |
 |---|---|---|
 | Source in this repo | Google Drive / Docs | GitHub |
 | What proves the identity | your IdP's signed JWT, re-verified inside the agent, `email` claim taken from it | the same JWT, exchanged for a token the target will accept |
@@ -86,7 +86,7 @@ independently of the components diagram and of each other.
 | Who sets it up | a Workspace super-admin, once, for everyone | each user, for themselves |
 | Fails when | the token has no verified `email`, or the address is not the Workspace **primary** address | the user declines, or the vault never received the `session_id` |
 
-### End-user experience — OBO flow (Google Drive)
+### End-user experience — delegation flow (Google Drive)
 
 ```
 $ python3 client/login.py
@@ -145,7 +145,7 @@ Confidence: HIGH   Connected sources: ['github']
 ```
 
 So it is genuinely one click per user per source — but it *is* a click, by a person,
-and the OBO flow has no equivalent at any step.
+and the delegation flow has no equivalent at any step.
 
 ### With both sources enabled
 
@@ -153,6 +153,71 @@ Both are searched on every question and results are merged, each citation carryi
 its source. A user who has approved GitHub but whose Drive is empty gets a grounded
 answer from GitHub alone and exit code `0` — a partial answer from the connected
 sources is a real answer. Exit `3` means *nothing* was searched.
+
+## Okta Cross-App Access (XAA) vs. AgentCore token exchange (M3)
+
+A recurring question is whether Okta **Cross-App Access (XAA / ID-JAG)** replaces the
+per-source consent (M1) with a single "auth once, reach everything" flow, and if so why
+this solution routes token exchange (**M3**) through **AgentCore Identity** rather than
+driving XAA directly. The short answer: the two are not interchangeable, and M3 today is
+a *deliberately unused* path because the exchange it needs is not possible as of now on
+either side. The essentials:
+
+**XAA is a two-leg protocol; AgentCore performs one hop.** Verified against the IETF WG
+draft `draft-ietf-oauth-identity-assertion-authz-grant-04` (not yet an RFC; the
+`…:token-type:id-jag` URN is not yet IANA-registered):
+
+| | Leg 1 — at the **IdP** (Okta) | Leg 2 — at the **RP's own AS** |
+|---|---|---|
+| `grant_type` | `token-exchange` (RFC 8693) | `jwt-bearer` (RFC 7523) |
+| sends | `subject_token` = user's id_token | `assertion` = **the ID-JAG** |
+| `requested_token_type` | **`…:token-type:id-jag`** ← the crux | — |
+| returns | the ID-JAG | the RP's access token |
+
+The ID-JAG is the **output of leg 1** and the **input to leg 2**. AgentCore Identity's
+`onBehalfOfTokenExchangeConfig` offers two `grantType` values (`TOKEN_EXCHANGE`,
+`JWT_AUTHORIZATION_GRANT`) — but they are two dialects for **one** hop, selected per
+credential provider, not legs 1 and 2.
+
+**M3 is not available today, and it is blocked by a THREE-link chain — every link must
+hold for a given source, and today none of the three does for any source we care about.**
+These are separate gaps on separate parties; closing one or two is not enough:
+
+| # | Link | Whose | Today |
+|---|---|---|---|
+| 1 | **Ripple's Okta issues an ID-JAG** — XAA must be GA, enabled on **Ripple's** Okta tenant, and the target registered as a relying party | Ripple's Okta | Unconfirmed. XAA is early and the public Okta XAA docs were not reachable during evaluation. (The tenant in `dev.env` today is an Auth0 dev tenant, which cannot mint an ID-JAG at all.) |
+| 2 | **AgentCore Identity requests the ID-JAG** | AWS (AgentCore) | **Not possible as of now.** No `requested_token_type` field anywhere in the API (not on the provider config, not on `GetResourceOauth2Token`), so it cannot ask for an ID-JAG, and `customParameters` is documented as unable to override standard OAuth parameters. Confirmed on the wire — injecting `requested_token_type` against an endpoint that validates token types before client auth changed nothing. |
+| 3 | **The target MCP server accepts the ID-JAG** — each source's own authorization server must support the XAA / ID-JAG relying-party side | each source vendor | Per source: **Slack — no** (its AS speaks `authorization_code` only); **Confluence / Atlassian — unconfirmed** (its endpoint routes token-exchange grants but rejects standard subject-token types today); **Databricks Genie — untested** (no environment yet). |
+
+*(Underlying all three: ID-JAG is still an IETF **draft**, not an RFC, and the
+`…:token-type:id-jag` URN is not yet IANA-registered.)*
+
+The links are **independent.** If AWS shipped an ID-JAG-aware grant tomorrow (link 2),
+M3 still would not work until Ripple's Okta issues the ID-JAG (link 1) **and** the
+specific target accepts it (link 3). Link 3 is per-source: **Databricks Genie, Slack MCP
+and Confluence MCP each have to support XAA on their own authorization server** — Ripple's
+Okta and AgentCore being ready does nothing for a source whose vendor does not accept an
+ID-JAG. The three links share only the missing artifact — the ID-JAG — which link 1 must
+**issue**, link 2 must **request**, and link 3 must **accept**.
+
+**Why we still route M3 through AgentCore Identity rather than hand-rolling XAA.** The
+alternative — implementing leg 1 ourselves — is only ~20 lines of `POST`, but it is the
+wrong ~20 lines: it means this solution holds the Okta client credential and owns ID-JAG
+signature / `typ` / `aud` validation forever. That is a standing security liability, so a
+hand-rolled exchange is treated as a defect, not an optimisation. Delegating the exchange
+to AgentCore Identity keeps that credential and that validation out of our code; the cost
+is that we can only do what its API exposes — hence M3 is drawn but unused until AgentCore
+adds `requested_token_type` (link 2) and Ripple's Okta tenant has XAA enabled with the
+target registered as a relying party (link 1).
+
+**What this means per connector, today.** XAA only pays off where the target's own
+authorization server supports the ID-JAG relying-party side (link 3) — realistically an
+Okta-guarded MCP server, or Databricks Genie if fronted the same way (untested). For the
+named third-party connectors it does **not** help regardless of Ripple's Okta roadmap:
+Slack advertises `authorization_code` only, and Google's `jwt-bearer` requires the
+assertion be signed with a **Google** service-account key (which is why Drive is M2
+delegation, not M3). Those are vendor rules about what their own authorization servers
+accept, so **M1 consent is the plan of record — not a stopgap — for Slack and Confluence.**
 
 ## Prerequisites
 
@@ -195,8 +260,9 @@ somewhere, so do these before touching the CLI:
 
 Empty AWS account to first answered question. Every step except 9 is one-time; step 9
 is the loop you actually use. Steps 1–9 give you the **consent flow** over GitHub;
-step 10 adds Google Drive and with it the **OBO flow**, and is optional but is the
-only way to demonstrate the no-consent path.
+step 10 adds Google Drive and with it the **delegation flow**, and is optional but is the
+only way to demonstrate the no-consent path. Step 11 deploys the two Gateways, which are
+additive and off by default — nothing above needs them.
 
 ### 1. Install
 
@@ -389,7 +455,7 @@ step to fail:
 | `deploy.py` exits 2 about `ALLOWED_EMAIL_DOMAINS` | The two Drive variables are a pair; see step 10. Working as intended. |
 | Confident "not found" that seems wrong | Check for `incompleteSearch` in the result. Drive sets it when some drives could not be searched, which makes a partial result look complete. |
 
-### 10. Optional — turn on Google Drive (the OBO flow)
+### 10. Optional — turn on Google Drive (the delegation flow)
 
 Everything above deploys the GitHub source and the consent flow. Drive is the second
 source and the **only** one that demonstrates the no-consent path, so it is worth
@@ -486,12 +552,251 @@ python3 client/login.py --claims     # must show "email" AND "email_verified": t
 python3 client/ask.py "what does the onboarding guide say about VPN access?"
 ```
 
-`Connected sources: ['gdrive', ...]` and no consent page means the OBO flow is live.
+`Connected sources: ['gdrive', ...]` and no consent page means the delegation flow is live.
 If Drive appears under *"could not be reached"* instead, `ask.py` prints the
 delegated-source advice — the cause is the claim or the grant, not anything a user
 can authorize away.
 
-### 11. Activate the cost allocation tag (once per account)
+### 11. Optional — deploy the two Gateways
+
+`infra/03-gateways.yaml` is a third stack, off by default and not needed for anything
+above. It creates:
+
+- an **ingress Gateway** — an HTTP front door with an `Http.AgentcoreRuntime` target in
+  front of the same runtime. Its outbound credential is `JWT_PASSTHROUGH`, so it forwards
+  the caller's `Authorization` header rather than fetching a token of its own.
+- a **tools Gateway** — an MCP server with the GitHub source as a target on per-user
+  `OAUTH`, `supportedVersions` pinned to `['2025-11-25', '2026-07-28']`.
+
+```bash
+export DEPLOY_GATEWAYS=true
+python3 scripts/deploy.py
+```
+
+It prints one more `export` line (`RIPPLE_TOOLS_GATEWAY_URL`) for `dev.env` and the
+ingress URL, which takes the same `{"prompt": ...}` body as the runtime — only the
+*tools* Gateway speaks MCP.
+
+Both are **additive**. The ingress Gateway is a second door, not a replacement: the
+runtime stays directly invocable and `client/ask.py` keeps calling it directly. Sources
+stay in-process until you move one, per source:
+
+```bash
+export GITHUB_VIA=GATEWAY     # then redeploy the runtime stack
+```
+
+`deploy.py` refuses `GITHUB_VIA=GATEWAY` with no Gateway available, rather than letting
+the agent fall back to in-process at startup with only a warning.
+
+⚠️ **Moving a source onto the tools Gateway asks the user to consent a SECOND time.**
+A vaulted token belongs to the workload that vaulted it, and the Gateway target's
+credential provider is a different workload from the runtime's — so a user who has
+already connected GitHub in-process must approve it again for the Gateway route. The
+Gateway signals this with an MCP *elicitation* (JSON-RPC `-32042`) carrying an authorize
+URL, which Ripple surfaces in the same `auth_required` field as any other consent, so a
+client does not need to know which route a source is on. The loopback return URL must be
+allowlisted on the *Gateway's* workload identity too, or the redirect after approval lands
+on nothing — the browser shows "This site can't be reached" and no error appears anywhere
+in AWS. `scripts/register_consent_url.py` now does both; re-run it after deploying the
+Gateways:
+
+```bash
+python3 scripts/register_consent_url.py   # runtime + tools Gateway, idempotent
+```
+
+Verified end to end on this route: consent completes, and search returns hits scoped to
+the caller's own repositories. Two defects were found by running it and are fixed —
+the elicitation URL used to be discarded and reported as a transport error, and the
+Gateway's OpenAPI target had no `/user` operation, so an account in no organizations
+searched *all public GitHub*. `agent/gateway_tool.py` now refuses to search unscoped
+rather than degrade quietly.
+
+The known cost of this route is answer quality, not correctness: an OpenAPI target cannot
+vary the `Accept` header per call, so hits arrive without GitHub's text-match snippets.
+In practice the deployed route still answered at HIGH confidence, because routing is **per
+operation** — only `search` moves to the Gateway, while `read_company_document` stays
+in-process, so the model recovers the text it needs by reading a promising hit in full.
+That recovery depends on the in-process credential also being present: a user who
+consented *only* to the Gateway has search but no `fetch`, and those answers do degrade to
+LOW. `IN_PROCESS` remains the default for that reason and because it needs one consent
+rather than two.
+
+⚠️ **Deploying the ingress Gateway does not close the direct path, and cannot today.**
+The runtime parameter that would (`AllowedWorkloadConfiguration`, pinning the runtime to
+one caller) is deliberately left unset, because a `JWT_PASSTHROUGH` target never mints a
+Workload Access Token and so never stamps the workload identity chain that parameter
+introspects — setting it while the target is on passthrough returns `401` on *every*
+path, the Gateway's included. Closing the bypass means moving the ingress target to
+`OAUTH` outbound **and** setting the parameter: one change, not two. The evidence, the
+trade-off, and the correct way to test it are in `infra/03-gateways.yaml`
+(`IngressGateway` comment, mitigation 2).
+
+Identity **does** survive the hop, and this is verified: the same user JWT sent to the
+Gateway URL and to the runtime directly resolves to the same named `sub`, which is what
+per-user Drive and GitHub reads depend on.
+
+⚠️ That verification only passes because the runtime sets
+`RequestHeaderConfiguration.RequestHeaderAllowlist: ['Authorization']`. The allowlist
+defaults to forwarding **nothing**, so without it `Authorization` reaches no container on
+either path and the agent answers as `"user": "anonymous"` with no connected sources — a
+`200`, not an error, which is what makes it easy to misread as an unconsented user. The
+template sets it; if you build your own runtime, set it too.
+
+### 12. Optional — deploy the managed AgentCore Harness (EXPERIMENTAL — don't use for now)
+
+> 🛑 **Do not use the harness route for deployment yet. Deploy via the runtime route
+> (steps 1–11, `02-runtime.yaml`) instead.** The harness is a deployed experiment, not the
+> production path: a caller can override its guardrails at invoke time (see the assessment
+> below) and it cannot serve Google Drive. The steps here are for reproducing that experiment,
+> not for shipping.
+
+`infra/04-harness.yaml` is a fourth stack, off by default. It deploys the same product as
+a **managed agent**: `AWS::BedrockAgentCore::Harness`, where the model, system prompt,
+tools, memory and iteration limits are *configuration* and **AWS runs the agent loop**.
+
+```bash
+export DEPLOY_GATEWAYS=true    # required: the harness's only tool is the tools Gateway
+export DEPLOY_HARNESS=true
+python3 scripts/deploy.py
+python3 scripts/register_consent_url.py   # now covers a THIRD workload identity
+```
+
+> **Full assessment: [`docs/HARNESS-ASSESSMENT.md`](docs/HARNESS-ASSESSMENT.md)** — why the
+> managed harness cannot yet be the primary agent, from live probes. Headline: on the harness
+> the system prompt and tool allowlist are *per-request defaults* rather than server-enforced
+> limits, so they cannot be relied on behind an untrusted front door the way the runtime's
+> baked-in guardrails can. That, plus the M2/M3 gaps below, is why `02-runtime.yaml` stays
+> primary. (The precise invoke-time behaviour was characterised separately and is not
+> reproduced here.)
+
+⚠️ **A Harness is not the SDK harness in our container, and it does not run `agent/agent.py`.**
+Two different things share the name. `bedrock_agentcore.runtime.BedrockAgentCoreApp` — what
+`agent.py` uses, and what step 7 deploys — is a server *inside* our image; our Python is
+the agent. `AWS::BedrockAgentCore::Harness` is a managed AWS resource with its own API and
+console page. On a Harness the container is an **environment, not an application**: AWS
+overrides its `ENTRYPOINT` and `CMD`, so our startup command never executes. `@app.entrypoint`
+is never called and `@tool`-decorated Python is never registered. A harness tool can only be
+one of five things — `remote_mcp`, `agentcore_gateway`, `agentcore_browser`,
+`agentcore_code_interpreter`, or `inline_function` (which runs in the *caller*).
+
+It also **provisions its own runtime underneath**. That is where the extra `harness_*`
+runtime and log group in the account come from; don't manage it directly.
+
+**This stack is additive, and the runtime stack must stay.** It is not a migration you can
+finish by deleting stack 2:
+
+| | Runtime (stack 2) | Harness (stack 4) |
+|---|---|---|
+| Agent loop | our Strands loop in `agent.py` | AWS's, service-side |
+| GitHub — consent flow | ✅ in-process, or via Gateway | ✅ declarative (`OutboundAuth.Oauth`) |
+| Google Drive — delegation flow | ✅ | ❌ **cannot be served** |
+| Model / prompt change | rebuild + redeploy image | `UpdateHarness` |
+| Conversation memory | provisioned, never read | ✅ read and written by AWS |
+| Iteration / token ceiling | none | `MaxIterations`, `MaxTokens` |
+| `--image-only` | rolls the image | no-op |
+
+⚠️ **The harness cannot serve Google Drive, and that is a security stop rather than a
+missing feature.** Two independent blockers. Its gateway outbound auth is a union of
+exactly `{AwsIam | None | Oauth}`, and Drive's mechanism is none of those — it is a JWT
+assertion signed with a *Google service account* key carrying the user's verified email in
+`sub`. And a Harness has **no `RequestHeaderConfiguration`**, so nothing in the tool path
+can read the caller's `Authorization` header; a Gateway Lambda target doesn't help either,
+as its context carries only gateway/target/tool ids and no caller. The service-account key
+holds domain-wide delegation, so the *only* thing narrowing it to one person is the subject
+we pass, which must come from a signature-verified claim. A Drive tool that cannot learn
+who is asking cannot narrow anything — it would turn a per-user read into a domain-wide one
+while every log line still looked correct. So the template ships **no** Drive tool rather
+than a degraded one. The two survivable designs, and why each moves a trust boundary, are
+in `infra/04-harness.yaml` § M2.
+
+**Testing it in the console playground.** *AgentCore → Harness → Harness playground* needs a
+JWT in **Configs → Authentication → JWT token** — being signed into the console is not
+enough, because the harness has a `CustomJWTAuthorizer` and refuses any session without a
+bearer token from *our* IdP:
+
+```bash
+python3 client/login.py --copy    # copies the token, prints only its remaining lifetime
+```
+
+It deliberately does not echo the token: that value is a bearer credential, so anything
+holding it can act as you until it expires — keep it out of scrollback, tickets and
+screenshots. Use `--print-token` if you need it on stdout anyway.
+
+**Status: deployed and invoked. The managed loop works; the Gateway tool does not yet.**
+Verified on `ripple_harness-5tCOqF76a2`: it reaches the model, honours the system prompt
+verbatim (`Sources:` block, `Confidence: LOW`, and a refusal to guess at a roadmap it could
+not retrieve), and writes to Memory. But loading its one tool fails:
+
+```
+runtimeClientError ... Failed to load tool 'ripple-tools' (type=agentcore_gateway):
+Failed to start MCP client ... Client error '401 Unauthorized' for url
+https://ripple-tools-xaeszuty3h.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp
+```
+
+The tools Gateway is on `CUSTOM_JWT` inbound, so it accepts only a bearer JWT from its
+configured issuer — **both** `AWS_IAM` (SigV4) and `NONE` are refused, tested. `OAUTH` is
+the matching value and is wired in the template, but it needs a credential provider for the
+*Gateway's* issuer (an Auth0 `client_credentials` client), and this project has only a
+public CLI client with no secret. Creating one is an Auth0-side action, so `AWS_IAM` remains
+the default as the least-surprising no-credential value — read it as *not yet wired*, not
+*verified*. Until then the harness answers every question at LOW confidence with no sources,
+and **does not surface the auth failure to the user**.
+
+⚠️ **A green stack proves nothing about whether the agent can answer.** Two of the three
+defects above were invisible at deploy time and only appeared inside the event stream on the
+first `InvokeHarness`. The other was `Temperature: 0.2` — accepted by the CFN schema, then
+rejected by the model with `` `temperature` is deprecated for this model `` on every
+invocation. Model parameters are validated by the *model* at invoke time, not by
+CloudFormation. Anything added to `Model` must be tested with a real call.
+
+⚠️ **Invoke it with a Bearer JWT, never SigV4.** SigV4 is refused outright here
+(`AccessDeniedException: This harness requires OAuth Bearer token authentication`) because
+of the authorizer below — but on a harness *without* one, SigV4 succeeds and silently stops
+propagating per-user identity downstream, collapsing every user's access onto one shared
+credential. That is why `AuthorizerConfiguration.CustomJWTAuthorizer` is load-bearing here
+in a way it isn't on the runtime. Note that boto3 needs the SigV4 signer *disabled*
+(`Config(signature_version=UNSIGNED)`) before an `Authorization` header survives — adding
+the header alone leaves SigV4 in place and the call is rejected.
+
+⚠️ **A third consent.** The harness is its own workload identity — the real one here is
+`harness_ripple_harness-ejdAHhBoDB` — so a user who already connected GitHub on the runtime
+*or* the Gateway route has **not** consented here, the same rule as step 11 applying a third
+time. Note the doubled word: the `harness_` prefix is literal and the harness name follows,
+and the service appends a random suffix, so the name **cannot be derived** and
+`register_consent_url.py` discovers it by prefix instead. Skip that step and the redirect
+after Approve lands on nothing, with no error anywhere in AWS.
+
+It also provisioned its own runtime, `harness_ripple_harness-ejdAHhBoDB` — same name as the
+workload identity. That is the answer to "where did this extra `harness_*` runtime and log
+group come from"; don't manage it directly.
+
+Two more things worth knowing before choosing this route. `AllowedTools` is set explicitly
+because a harness otherwise grants `shell` **and** `file_operations` in every session — a
+document-reading agent needs neither, and a prompt injection carried inside a retrieved
+document does. And `Memory.ActorId` is deliberately *not* set in the template: pinning it
+would give every caller one shared conversation history. Per-user partitioning comes from
+the `actorId` argument on `InvokeHarness`, which is **caller-controlled** — a request field,
+not a claim — so the caller must derive it from the verified token `sub`, or a caller can
+read another user's history. That is the header-vs-body trap `_caller_jwt()` exists to make
+unrepresentable, reappearing one layer up.
+
+What this route gives up, beyond Drive: `identity_claims.verified_email()`'s five checks
+(nothing re-verifies anything; the platform authorizer is the only gate), the per-source
+fan-out and merge that makes "which source said this" precise, the refusal that hides a
+POLICY failure from the user, and — concretely — the hard error in `gateway_tool.py::_scope`
+that makes an unscoped GitHub search impossible. On the harness the model calls the
+Gateway's tools directly, so only the **system prompt** stands between it and a search of
+all public GitHub. That defect was found by running the Gateway route and fixed in code;
+this path can reintroduce it. `tests/test_harness_prompt.py` exists for that reason — the
+prompt is duplicated in `agent.py` and in the template, and it fails when a load-bearing
+rule is dropped from either.
+
+Also: `M3 TOKEN EXCHANGE` **cannot be expressed in CloudFormation** on a harness. The API
+accepts a `TOKEN_EXCHANGE` grant type; the CFN schema for the same field accepts only
+`CLIENT_CREDENTIALS` and `AUTHORIZATION_CODE`. It needs `create-harness`/`update-harness`
+over the API until that closes.
+
+### 13. Activate the cost allocation tag (once per account)
 
 ```bash
 aws ce update-cost-allocation-tags-status --region us-east-1 \
@@ -551,19 +856,20 @@ Deploying by hand without `deploy.py`, and everything above in more depth:
 
 ## Architecture
 
-[`infra/ARCHITECTURE.md`](infra/ARCHITECTURE.md) — four diagrams: components and trust
-boundaries, then one sequence diagram per flow with every edge numbered
-(`infra/architecture-deploy-flow.png`, `infra/architecture-obo-flow.png`,
-`infra/architecture-consent-flow.png`).
+[`infra/ARCHITECTURE.md`](infra/ARCHITECTURE.md) — the component view plus one sequence
+diagram per flow with every edge numbered (`infra/architecture-deploy-flow.png`,
+`infra/architecture-delegation-flow.png`, `infra/architecture-consent-flow.png`).
 
-`infra/architecture-components.png` is the one to read first. It draws **both flows
-at once** — green `1a`–`14a` for OBO, orange `1b`–`14b` plus `★` for consent — with a
-step-by-step table per flow derived from the same edge list that draws the arrows, so
-a badge and its description cannot disagree. Solid tiles are deployed; dashed ones
-are target state. The three flow PNGs then draw one flow each, in sequence form, and
-number their own flow independently: a step number from one of them means nothing
-without naming which diagram it came from. Every source file carries a
-`WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM` comment naming the components and
+[`infra/architecture-components-v3.png`](infra/architecture-components-v3.png) is the
+current component view. It draws **both flows at once** — green `1a`–`14a` for delegation,
+orange `1b`–`14b` plus `★` for consent — with a step-by-step table per flow derived from
+the same edge list that draws the arrows, so a badge and its description cannot disagree.
+It also badges every last hop with the mechanism it uses (`M1` / `M2` / `M3`). Dashed
+tiles do not exist yet; solid ones do, and a solid tile tagged **OPT-IN** — both Gateways —
+is deployed but off the traced path until configured. The three flow PNGs then draw one
+flow each, in sequence form, and number their own flow independently: a step number from
+one of them means nothing without naming which diagram it came from. Every source file
+carries a `WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM` comment naming the components and
 numbered steps it implements, so you can grep from either direction:
 
 ```bash
@@ -577,11 +883,28 @@ deliberate, and the file explains exactly what to change to make it stateful.
 Regenerate the PNGs (needs `matplotlib`, run from this directory):
 
 ```bash
-python3 infra/render_components.py
-python3 infra/render_diagrams.py
+python3 infra/render_components_v3.py   # the current component diagram
+python3 infra/render_diagrams.py        # the three flow diagrams
 ```
 
 Both refuse to emit a PNG that fails their self-checks.
+
+### Earlier implementations
+
+The current component diagram is `infra/architecture-components-v3.png` (rendered by
+`infra/render_components_v3.py`). Two superseded drawings are kept only as a record of
+what the diagram used to claim — not as alternatives, and nothing above depends on them:
+
+- `architecture-components.png` (v1) labels the Google Drive path **"OBO"**, a name this
+  repo has since retired: in `agent/agent.py` that word means the *token exchange* (M3),
+  while Drive is *delegation* (M2). Read v1's green arrows as M2. It also predates the
+  second Gateway and the five-source picture.
+- `architecture-components-v2.png` (v2) is an intermediate view without the M1/M2/M3 hop
+  badges.
+
+`render_components.py` and `render_components_v2.py` still run and emit these historical
+PNGs — use them only to reproduce a past diagram, never to update the current one.
+`infra/README.md` has the full version table.
 
 ## Notes for reviewers
 
@@ -600,4 +923,4 @@ Both refuse to emit a PNG that fails their self-checks.
 - **Cost attribution.** Every resource carries `project_name=ripple_slack_assistant`
   natively at creation, including the two IAM roles — which the toolkit's shared
   `AgentCoreRuntimeRole` could not, because it was shared across four agents.
-  Activation in Billing is Quickstart step 11.
+  Activation in Billing is Quickstart step 13.

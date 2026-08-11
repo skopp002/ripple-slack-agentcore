@@ -6,16 +6,26 @@ box has neither (nor docker). The diagrams are drawn with matplotlib instead.
 
 ONE DIAGRAM PER FLOW, AND THE FILENAME SAYS WHICH FLOW. There are three:
 
-    architecture-deploy-flow.png    how the system gets built and deployed
-    architecture-obo-flow.png       answering from Google Drive — no consent screen
-    architecture-consent-flow.png   answering from GitHub — one consent click
+    architecture-deploy-flow.png      how the system gets built and deployed
+    architecture-delegation-flow.png  answering from Google Drive — no consent screen
+    architecture-consent-flow.png     answering from GitHub — one consent click
 
-That is a deliberate reduction from four. An earlier "request time" diagram drew the
-consent path only, under a name that promised both, so a reader looking for the OBO
-flow found the consent flow with no label saying so; a second diagram then drew both
-paths on one canvas, which meant neither could be read without disentangling it from
-the other. Splitting by flow means every numbered step on a canvas belongs to the flow
-the filename names. The one diagram that still draws both together is
+⚠️ THE MIDDLE ONE USED TO BE CALLED architecture-obo-flow.png, AND THE RENAME IS THE
+POINT, not tidying. "OBO" is overloaded: agent.py reserves it for
+ON_BEHALF_OF_TOKEN_EXCHANGE, which is M3 — RFC 8693, no third-party source uses it, and
+Google Drive CANNOT use it because Google requires a service-account assertion signed
+with a key we hold. The flow drawn here is M2, DELEGATION. So the old filename named the
+one mechanism the diagram does not draw, and asserted it in the one place a reader cannot
+miss. The word does not appear as a mechanism name anywhere in this file any more; where
+M3 is genuinely meant, the full ON_BEHALF_OF_TOKEN_EXCHANGE is spelled out. See
+render_components_v3.py for the authoritative M1/M2/M3 vocabulary.
+
+Three is a deliberate reduction from four. An earlier "request time" diagram drew the
+consent path only, under a name that promised both, so a reader looking for the
+delegation flow found the consent flow with no label saying so; a second diagram then
+drew both paths on one canvas, which meant neither could be read without disentangling it
+from the other. Splitting by flow means every numbered step on a canvas belongs to the
+flow the filename names. The one diagram that still draws both together is
 architecture-components.png (render_components.py), which is a component map rather
 than a sequence and says so in its title.
 
@@ -51,8 +61,8 @@ Usage:
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
 
 This file is not on any flow — it DRAWS the three sequence diagrams above, and none of
-them is the components diagram. Numbering here is per-flow and contiguous: the OBO flow
-runs 1-17, the consent flow 1-26, the deploy flow 1-21. The components diagram numbers
+them is the components diagram. Numbering here is per-flow and contiguous: the delegation
+flow runs 1-17, the consent flow 1-26, the deploy flow 1-21. The components diagram numbers
 the same two request stories differently (1-5 shared, then 6a-14a and 6b-14b) because it
 draws them on one canvas and needs the a/b suffix to tell them apart. Neither scheme is
 derived from the other, so a step number is meaningless without naming the diagram it
@@ -89,8 +99,8 @@ LEGEND = [
 ]
 
 # Per-flow accent, used for the flow banner and the START / END badges. Same
-# convention as render_components.py: green = OBO, orange = consent.
-ACCENT = {"deploy": "#2d6ca2", "obo": "#3f8f43", "consent": "#c8791d"}
+# convention as render_components.py: green = delegation (M2), orange = consent (M1).
+ACCENT = {"deploy": "#2d6ca2", "delegation": "#3f8f43", "consent": "#c8791d"}
 
 # ===========================================================================
 # DEPLOY FLOW — architecture-deploy-flow.png
@@ -161,14 +171,19 @@ DEPLOY_NOTE = (
     "flow of the three that does not return to an end user, because no end user takes part "
     "in it.\n"
     "The runtime endpoint 'live' is created by edge 11 but sends no deploy-time message — "
-    "it is where the OBO and consent flows both begin their authenticated invoke.\n"
+    "it is where the delegation and consent flows both begin their authenticated invoke.\n"
     "Edges 2 and 11 target the CloudFormation service, which then creates the [CFN] "
     "lifelines bracketed as STACK 1 / STACK 2.\n"
     "Edge 17 is the only step that can block a cutover, and only because replacing the "
     "credential provider issues a new callback URL.")
 
 # ===========================================================================
-# OBO FLOW — architecture-obo-flow.png
+# DELEGATION FLOW (M2) — architecture-delegation-flow.png
+#
+# NOT a token exchange, and the old name for this file said it was. M2 is domain-wide
+# delegation: we hold a Google service-account key and sign an assertion naming the user.
+# M3 (ON_BEHALF_OF_TOKEN_EXCHANGE) is RFC 8693, brokered by AgentCore Identity, and Drive
+# can never move to it — see the note at edge 11.
 #
 # The flow the demo exercises. Google Drive is reached with a token minted FOR the
 # calling user by domain-wide delegation, so no consent screen exists anywhere on this
@@ -180,7 +195,7 @@ DEPLOY_NOTE = (
 # itself, three fail-closed gates; edge 11 is the assertion whose `sub` is the email
 # that verification produced. Impersonation is safe only because 8 precedes 11.
 # ===========================================================================
-OBO_COLS = [
+DELEG_COLS = [
     ("USER",   "User", "OPS"),
     ("CLI",    "Caller\nclient/login.py + ask.py", "OPS"),
     ("IDP",    "IdP\nauthorization server", "EXT"),
@@ -191,13 +206,13 @@ OBO_COLS = [
     ("GSTS",   "Google STS\noauth2.googleapis.com", "EXT"),
     ("GDRIVE", "Google Drive + Docs\nAPI", "EXT"),
 ]
-OBO_BANDS = [
+DELEG_BANDS = [
     ("USER", "CLI", "caller", "#3f8f43"),
     ("IDP", "IDP", "the ONE login", "#6b6b6b"),
     ("EP", "BR", "inside AWS — CloudFormation-owned", "#2d6ca2"),
-    ("SM", "GDRIVE", "the OBO exchange — no consent screen exists here", "#3f8f43"),
+    ("SM", "GDRIVE", "the delegation hop — no consent screen exists here", "#3f8f43"),
 ]
-OBO_EDGES = [
+DELEG_EDGES = [
     ("USER", "CLI", 1, "START — the user runs client/login.py, then asks a question", "-"),
     ("CLI", "IDP", 2, "device-code grant; no per-source prompt is requested anywhere in this flow", "-"),
     ("USER", "IDP", 3, "approves the device code in a browser — ONE sign-in, not one per source", ":"),
@@ -219,14 +234,14 @@ OBO_EDGES = [
     ("EP", "CLI", 16, "HTTP response", "-"),
     ("CLI", "USER", 17, "END — the answer is printed with citations. One invocation, no consent screen.", "-"),
 ]
-OBO_PHASES = [
+DELEG_PHASES = [
     (1, "▶  START — SIGN IN ONCE  (the only interactive step here)"),
     (5, "AUTHENTICATED INVOKE"),
     (8, "VERIFY THE USER, THEN IMPERSONATE THEM  (8 must precede 11)"),
     (13, "RETRIEVE — Drive trims to this user"),
     (15, "RESPONSE   ->   ■  END"),
 ]
-OBO_NOTE = (
+DELEG_NOTE = (
     "START and END are both the user, and exactly ONE invocation sits between them: the "
     "question asked at edge 1 is answered at edge 17 without interruption.\n"
     "NO CONSENT SCREEN EXISTS ON THIS CANVAS. The Workspace admin granted domain-wide "
@@ -256,11 +271,11 @@ OBO_NOTE = (
 # ===========================================================================
 # CONSENT FLOW — architecture-consent-flow.png
 #
-# GitHub, which cannot do the OBO exchange: its token endpoint answers the exchange
+# GitHub, which cannot do the M3 token exchange: its token endpoint answers the RFC 8693
 # grant with unsupported_grant_type (verified empirically), so the user's own OAuth
 # token has to be brokered and vaulted instead.
 #
-# WHY THIS DIAGRAM IS HALF AGAIN AS LONG AS THE OBO ONE. It draws what happens rather
+# WHY THIS DIAGRAM IS HALF AGAIN AS LONG AS THE DELEGATION ONE. It draws what happens rather
 # than what is convenient to draw: TWO invocations. The runtime does not hold a request
 # open waiting for a human (CONSENT_WAIT_SECONDS = 0, NoWaitTokenPoller), so the first
 # ask returns a URL instead of content and the client re-asks afterwards. An earlier
@@ -340,15 +355,17 @@ CONSENT_NOTE = (
     "user will have approved and the vault will still be empty — and the first ask then "
     "repeats forever with no error naming the cause.\n"
     "GITHUB IS ON THIS FLOW BECAUSE IT HAS TO BE, not by choice: its token endpoint "
-    "answers the OBO exchange grant with unsupported_grant_type. The OBO flow needs the "
-    "SOURCE to accept a brokered assertion, and SSO into a vendor is not that.\n"
-    "THE GUARANTEE IS THE SAME ONE THE OBO FLOW MAKES. Edge 22 calls GitHub with a token "
-    "representing the USER, so GitHub itself trims the results. The two flows differ in "
-    "who consents and who holds a long-lived credential — never in who the source thinks "
-    "is asking.\n"
+    "answers the M3 token-exchange grant with unsupported_grant_type. A brokered exchange "
+    "needs the SOURCE to accept a brokered assertion, and SSO into a vendor is not that.\n"
+    "THE GUARANTEE IS THE SAME ONE THE DELEGATION FLOW MAKES. Edge 22 calls GitHub with a "
+    "token representing the USER, so GitHub itself trims the results. The two flows differ "
+    "in who consents and who holds a long-lived credential — never in who the source "
+    "thinks is asking.\n"
     "WHICH FLOW A SOURCE USES IS CONFIGURATION, NOT CODE — <SOURCE>_AUTH_FLOW, resolved "
-    "per source by agent.py _flow_for(). Moving a source onto the OBO flow is a parameter "
-    "change, and edge 20 is the call site that does not change with it.")
+    "per source by agent.py _flow_for(). That variable selects M1 (USER_FEDERATION) or M3 "
+    "(ON_BEHALF_OF_TOKEN_EXCHANGE); it cannot select the delegation flow, which is chosen "
+    "by a source's `credential` axis instead. Edge 20 is the call site that does not "
+    "change either way.")
 
 # ---------------------------------------------------------------------------
 # The three specs. `slug` picks the accent and names the file; `doc_heading` is the
@@ -364,23 +381,25 @@ SPECS = [
                   "infra/ARCHITECTURE.md. Read top to bottom.",
          out="architecture-deploy-flow.png",
          doc_heading="Deploy flow"),
-    dict(slug="obo", cols=OBO_COLS, edges=OBO_EDGES, bands=OBO_BANDS,
-         phases=OBO_PHASES, note=OBO_NOTE,
-         flow="OBO FLOW   —   no consent screen, ever",
-         title="Ripple — OBO FLOW: answering from Google Drive with no consent screen",
+    dict(slug="delegation", cols=DELEG_COLS, edges=DELEG_EDGES, bands=DELEG_BANDS,
+         phases=DELEG_PHASES, note=DELEG_NOTE,
+         flow="DELEGATION FLOW  (M2)   —   no consent screen, ever",
+         title="Ripple — DELEGATION FLOW (M2): answering from Google Drive with no "
+               "consent screen",
          subtitle="Starts and ends at the user, in ONE invocation. The verified email "
                   "claim becomes the subject of a service-account assertion, so Google "
                   "returns a token scoped to that one user and Drive trims the results "
-                  "itself.",
-         out="architecture-obo-flow.png",
-         doc_heading="OBO flow"),
+                  "itself. NOT a token exchange: Google requires an assertion signed "
+                  "with a key we hold, which is why this can never become M3.",
+         out="architecture-delegation-flow.png",
+         doc_heading="Delegation flow"),
     dict(slug="consent", cols=CONSENT_COLS, edges=CONSENT_EDGES, bands=CONSENT_BANDS,
          phases=CONSENT_PHASES, note=CONSENT_NOTE,
          flow="CONSENT FLOW   —   one click per user, per source",
          title="Ripple — CONSENT FLOW: answering from GitHub after one consent click",
          subtitle="Starts and ends at the user, but across TWO invocations, because a "
                   "human acts in the middle and the runtime does not wait for one. The "
-                  "guarantee at the end is identical to the OBO flow's.",
+                  "guarantee at the end is identical to the delegation flow's.",
          out="architecture-consent-flow.png",
          doc_heading="Consent flow"),
 ]

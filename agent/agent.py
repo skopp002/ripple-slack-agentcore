@@ -112,6 +112,7 @@ from bedrock_agentcore.services.identity import TokenPoller
 from strands import Agent, tool
 from strands.models import BedrockModel
 
+import gateway_tool
 from github_tool import fetch_document, list_sources, search_github
 from identity_claims import ClaimVerificationError, verified_email
 
@@ -277,30 +278,40 @@ class NoWaitTokenPoller(TokenPoller):
 # and who holds long-lived credentials. Keeping the choice in this table is what lets
 # `invoke()` stay one loop over `ENABLED`.
 #
-# ⚠️ OBO IS NOT UNIVERSALLY AVAILABLE, and the failure is not graceful — it is a hard
-# error from the vendor's token endpoint. Verified empirically: GitHub returns
+# ⚠️ TOKEN EXCHANGE IS NOT UNIVERSALLY AVAILABLE, and the failure is not graceful — it
+# is a hard error from the vendor's token endpoint. Verified empirically: GitHub returns
 # `{"error": "unsupported_grant_type"}` for the token-exchange grant, so GitHub CANNOT
-# use OBO no matter how identity is arranged. Do not set `flow` to OBO for a source
-# without first confirming against that vendor's token endpoint that it accepts the
-# exchange.
+# use it no matter how identity is arranged. Do not set `flow` to
+# ON_BEHALF_OF_TOKEN_EXCHANGE for a source without first confirming against that
+# vendor's token endpoint that it accepts the exchange.
+#
+# ⚠️ DO NOT CALL THIS "OBO" — the word is retired in this repo, and this constant is
+# why. It was `_FLOW_OBO`, which read as the generic "on behalf of the user" and so got
+# applied to the GOOGLE DRIVE path in an early diagram. Drive is DELEGATED_SUBJECT below
+# — a Google-signed service-account assertion, a different mechanism with a different
+# blast radius, and one that can NEVER become a token exchange because Google requires
+# the assertion be signed with a key we hold. Two mechanisms under one name meant
+# reviewers could not tell which arrow was which. The full M1/M2/M3 vocabulary is in
+# infra/render_components_v3.py.
 _FLOW_USER_FEDERATION = "USER_FEDERATION"
-_FLOW_OBO = "ON_BEHALF_OF_TOKEN_EXCHANGE"
+_FLOW_TOKEN_EXCHANGE = "ON_BEHALF_OF_TOKEN_EXCHANGE"
 
 
 def _flow_for(key: str, default: str = _FLOW_USER_FEDERATION) -> str:
     """Resolve a source's token path from `<KEY>_AUTH_FLOW`, defaulting to consent.
 
     Defaults to USER_FEDERATION deliberately: it works against any OAuth2 provider,
-    whereas OBO silently requires vendor support. A wrong default that always works is
-    better than one that fails at the first question with `unsupported_grant_type`.
+    whereas the token exchange silently requires vendor support. A wrong default that
+    always works is better than one that fails at the first question with
+    `unsupported_grant_type`.
     """
     val = (os.environ.get(f"{key.upper()}_AUTH_FLOW") or "").strip().upper()
     if not val:
         return default
-    if val not in (_FLOW_USER_FEDERATION, _FLOW_OBO):
+    if val not in (_FLOW_USER_FEDERATION, _FLOW_TOKEN_EXCHANGE):
         raise RuntimeError(
             f"{key.upper()}_AUTH_FLOW must be {_FLOW_USER_FEDERATION} or "
-            f"{_FLOW_OBO}, got {val!r}"
+            f"{_FLOW_TOKEN_EXCHANGE}, got {val!r}"
         )
     return val
 
@@ -309,8 +320,8 @@ def _flow_for(key: str, default: str = _FLOW_USER_FEDERATION) -> str:
 # HOW a source's per-user credential is obtained. Orthogonal to `flow`, which only
 # describes the OAuth variant used by the vaulted path.
 #
-#   VAULTED_OAUTH   AgentCore Identity brokers a per-user token (consent or OBO) and
-#                   the search callable receives that TOKEN.
+#   VAULTED_OAUTH   AgentCore Identity brokers a per-user token (consent or token
+#                   exchange) and the search callable receives that TOKEN.
 #   DELEGATED_SUBJECT
 #                   No user token exists. The source impersonates the user by NAME,
 #                   so the callable receives the VERIFIED EMAIL instead. Google Drive
@@ -328,9 +339,66 @@ def _flow_for(key: str, default: str = _FLOW_USER_FEDERATION) -> str:
 _CRED_VAULTED = "VAULTED_OAUTH"
 _CRED_DELEGATED = "DELEGATED_SUBJECT"
 
+
+# ---- ROUTE (`via`) --------------------------------------------------------------
+# WHERE a source's call is made from, and therefore WHO HOLDS THE SOURCE TOKEN. A third
+# axis, orthogonal to both `credential` and `flow` — which is why it is its own key
+# rather than another value of either.
+#
+#   IN_PROCESS  This container calls the vendor's API directly. agent.py obtains the
+#               per-user credential and passes it to the source's callable, so a source
+#               access token lives in this process's memory for the turn.
+#   GATEWAY     The call goes to the Tools Gateway over MCP, carrying the USER'S OWN IdP
+#               JWT. The gateway authenticates that, then fetches the source token
+#               itself from its target's credential provider. **This container never
+#               sees a source token.**
+#
+# Both keep the invariant that matters: the call runs as the user and the SOURCE trims.
+# What GATEWAY adds is that a compromise of this container yields no source credential.
+#
+# ⚠️ M2 DELEGATION CAN NEVER BE `GATEWAY`. This is structural, not a backlog item. The
+# Gateway's OAuthGrantType enum is exactly {CLIENT_CREDENTIALS, AUTHORIZATION_CODE,
+# TOKEN_EXCHANGE}; M2 needs an assertion signed with a *Google* service-account key,
+# which is none of those and which a gateway could not mint regardless — it does not hold
+# Google's key material. So `gdrive` stays IN_PROCESS permanently and the tools gateway
+# is asymmetric by necessity. Documented, not hidden. (See infra/03-gateways.yaml.)
+#
+# ⚠️ AND `GATEWAY` IS NOT STRICTLY BETTER TODAY — GitHub defaults to IN_PROCESS. The
+# gateway route loses GitHub's text-match fragments, because an OpenAPI target cannot
+# vary the Accept header per call; hits arrive as metadata with no quotable text, and
+# under STRICT GROUNDING that lands as LOW confidence rather than as an error. Reachable
+# and wired, worse answers. Flip a source with <KEY>_VIA=GATEWAY once that is fixed.
+_VIA_IN_PROCESS = "IN_PROCESS"
+_VIA_GATEWAY = "GATEWAY"
+
+
+def _via_for(key: str, default: str = _VIA_IN_PROCESS) -> str:
+    """Resolve a source's route from `<KEY>_VIA`, defaulting to in-process.
+
+    Same config-not-code rule as `_flow_for` (FR-34): a source moves between routes by
+    configuration. Falls back to IN_PROCESS when the gateway is not deployed, so the
+    agent still runs with no gateway at all rather than failing every search.
+    """
+    val = (os.environ.get(f"{key.upper()}_VIA") or "").strip().upper()
+    if not val:
+        return default
+    if val not in (_VIA_IN_PROCESS, _VIA_GATEWAY):
+        raise RuntimeError(
+            f"{key.upper()}_VIA must be {_VIA_IN_PROCESS} or {_VIA_GATEWAY}, "
+            f"got {val!r}"
+        )
+    if val == _VIA_GATEWAY and not gateway_tool.is_configured():
+        print(f"WARNING: source '{key}' requests {_VIA_GATEWAY} but "
+              f"RIPPLE_TOOLS_GATEWAY_URL is unset; falling back to "
+              f"{_VIA_IN_PROCESS}.", flush=True)
+        return _VIA_IN_PROCESS
+    return val
+
+
 SOURCES: dict[str, dict] = {
     "github": {
         "credential": _CRED_VAULTED,
+        "via": _via_for("github"),
         "provider": os.environ.get("GITHUB_CREDENTIAL_PROVIDER"),
         "scopes": (os.environ.get("GITHUB_SCOPES") or "").split(),
         # GitHub does NOT support the token-exchange grant (tested: it returns
@@ -347,6 +415,10 @@ SOURCES: dict[str, dict] = {
     # GOOGLE_SA_SECRET_ARN; absent, the row is skipped like any other.
     "gdrive": {
         "credential": _CRED_DELEGATED,
+        # HARDCODED, not `_via_for("gdrive")`, and that asymmetry is the point: there is
+        # no configuration under which M2 DELEGATION can traverse the gateway (see the
+        # ROUTE note above). Making it settable would advertise a route that cannot work.
+        "via": _VIA_IN_PROCESS,
         # No credential provider and no scopes: there is no vaulted OAuth token to
         # broker. Google scopes are granted ONCE by a Workspace admin in the
         # domain-wide delegation grant, not requested per user per call.
@@ -385,6 +457,24 @@ if SOURCES["gdrive"]["enabled_by"] and os.environ.get(SOURCES["gdrive"]["enabled
         print(f"WARNING: GOOGLE_SA_SECRET_ARN is set but the Google client libraries "
               f"are missing ({e}); the Drive source is DISABLED. Rebuild the image "
               f"with requirements.txt current.", flush=True)
+
+# Rebind any GATEWAY-routed source's callables to the gateway client. Done here rather
+# than inline in the table so the table states INTENT (`via`) and this states the single
+# consequence of it — one place to look when a route behaves differently.
+#
+# ⚠️ ONLY `search` MOVES. `fetch` and `inventory` stay on their in-process
+# implementations even for a gateway-routed source, because the gateway's GitHub target
+# exposes only the two operations the scope composition needs (see infra/03-gateways.yaml).
+# So a source is PARTLY routed, and the two halves need DIFFERENT credentials in the same
+# turn: gateway `search` needs the user's IdP JWT, in-process `fetch` needs the vaulted
+# source token. `_credential_for()` below resolves that per call, and the vaulted token is
+# still fetched for a gateway-routed source precisely because fetch/inventory need it.
+for _key, _src in SOURCES.items():
+    if _src.get("via") == _VIA_GATEWAY and _key == "github":
+        _src["search"] = gateway_tool.search_github_via_gateway
+        print(f"source '{_key}' routes search through the Tools Gateway "
+              f"({_VIA_GATEWAY}); this container will not hold its source token for "
+              f"search.", flush=True)
 
 
 def _is_enabled(src: dict) -> bool:
@@ -536,7 +626,8 @@ def _user_sub(access_token: str) -> str:
         return "anonymous"
 
 
-def _build_agent(tokens: dict[str, str]) -> Agent:
+def _build_agent(tokens: dict[str, str], user_jwt: str = "",
+                 gateway_consent: dict[str, str] | None = None) -> Agent:
     """Build the turn's agent.
 
     `tokens` maps source key -> that source's PER-USER CREDENTIAL, which is one of two
@@ -545,10 +636,38 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
       DELEGATED_SUBJECT  this user's VERIFIED email, which the source impersonates
     Absent or empty means unavailable, so that source is not searched.
 
-    The tools below do not branch on which kind it is — each source's callables know
-    what they receive. That is why a delegated source needs no change to any tool, and
-    why `tokens` is passed straight through rather than interpreted here.
+    `user_jwt` is the caller's own IdP token, needed for GATEWAY-routed calls: the
+    gateway authenticates the USER and fetches the source token itself, so the credential
+    it wants is the JWT rather than anything in `tokens`.
+
+    `gateway_consent` is an OUT-parameter: the tools below write `source key -> consent
+    URL` into it when a GATEWAY-routed source turns out to need this user's authorization.
+    It exists because that fact is only discoverable DURING the turn — the pre-flight loop
+    in `invoke()` cannot find it, since a gateway source has no token to fetch here (the
+    gateway holds it), so its consent state is unknown until a tool actually calls out.
+    A mutable dict rather than a return value because the caller is the model's tool loop,
+    which has no channel back to `invoke()`. Same role `auth_urls` plays for the
+    in-process path, and it feeds the same `auth_required` key in the response.
+
+    The tools below still do not branch on the credential KIND — each source's callables
+    know what they receive. What they do consult is `_credential_for()`, because a
+    partly-routed source needs a different credential for `search` than for `fetch`
+    within one turn.
     """
+
+    def _credential_for(key: str, operation: str) -> str:
+        """The credential this source's `operation` callable expects.
+
+        Routing is PER OPERATION, not per source, because only `search` moves onto the
+        gateway (see the rebinding loop above). Getting this wrong is silent rather than
+        loud — handing a gateway callable a GitHub token produces a 401 from the
+        gateway's authorizer, which reads as "the gateway is broken" — so the choice is
+        made in one place against the same `via` flag that did the rebinding.
+        """
+        src = ENABLED.get(key) or {}
+        if src.get("via") == _VIA_GATEWAY and operation == "search":
+            return user_jwt
+        return tokens.get(key) or ""
 
     @tool
     def search_company_documents(query: str) -> str:
@@ -564,7 +683,7 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
         # individually — a Confluence outage should degrade the answer, not void it.
         hits: list = []
         for key, src in ENABLED.items():
-            token = tokens.get(key)
+            token = _credential_for(key, "search")
             if not token:
                 continue
             try:
@@ -579,6 +698,23 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
                     if h.get("ref"):
                         h["ref"] = f"{key}::{h['ref']}"
                 hits.extend(found)
+            except gateway_tool.ElicitationRequired as e:
+                # The gateway needs its OWN consent for this user (a second consent —
+                # see gateway_tool.ELICITATION_CODE). Record the URL for `auth_required`
+                # so the client can drive it, and tell the MODEL that the source is
+                # unconnected rather than broken: the previous generic error made it
+                # write "the connector returned an error… it likely needs attention from
+                # whoever manages the integration", pointing the user at an operator for
+                # something only the user can do.
+                if gateway_consent is not None:
+                    gateway_consent[key] = e.url
+                # Deliberately NOT the URL itself. The model would print it, and a
+                # hand-opened URL does not complete the flow (client/consent.py) — the
+                # client has the return-URL machinery, the answer text does not.
+                hits.append({"source": key, "error": (
+                    "not connected: this source needs a one-time authorization from "
+                    "you. The client will prompt for it — no action is needed from an "
+                    "administrator.")})
             except Exception as e:  # surface auth/permission errors cleanly
                 hits.append({"source": key, "error": str(e)[:200]})
         return json.dumps(hits)
@@ -601,7 +737,7 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
         key, _, native = ref.partition("::")
         if not native:  # unprefixed: only unambiguous while exactly one source is live
             fetchable = [k for k, s in ENABLED.items()
-                         if s.get("fetch") and tokens.get(k)]
+                         if s.get("fetch") and _credential_for(k, "fetch")]
             if len(fetchable) != 1:
                 return json.dumps({"error": (
                     f"ambiguous ref {ref!r}: prefix it with a source key "
@@ -610,7 +746,7 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
         src = ENABLED.get(key)
         if not src or not src.get("fetch"):
             return json.dumps({"error": f"source '{key}' cannot read documents"})
-        token = tokens.get(key)
+        token = _credential_for(key, "fetch")
         if not token:
             return json.dumps({"error": f"source '{key}' is not connected"})
         try:
@@ -634,7 +770,7 @@ def _build_agent(tokens: dict[str, str]) -> Agent:
         """
         items: list = []
         for key, src in ENABLED.items():
-            token = tokens.get(key)
+            token = _credential_for(key, "inventory")
             if not token or not src.get("inventory"):
                 continue
             try:
@@ -735,7 +871,7 @@ async def invoke(payload, context):
     # Sources are independent: a user connected to GitHub but not Confluence gets
     # GitHub results, not an error.
     #
-    # ---- HOW THE USER'S IDENTITY REACHES THE EXCHANGE (the OBO question) ----------
+    # ---- HOW THE USER'S IDENTITY REACHES THE EXCHANGE -----------------------------
     # Nothing here passes `user_jwt` to Identity explicitly, and that is correct — it
     # would be the wrong design, because a token the agent chooses is a token the agent
     # could forge. The propagation is ambient and platform-enforced:
@@ -749,8 +885,8 @@ async def invoke(payload, context):
     #      `workloadIdentityToken` on GetResourceOauth2Token.
     #
     # So the user identity Identity acts on is the one the AUTHORIZER verified, not one
-    # this code asserts. That is exactly the property you want from OBO: the agent
-    # cannot request a token for a user it cannot prove. `user_jwt` below is used only
+    # this code asserts. That is exactly the property you want from a brokered exchange:
+    # the agent cannot request a token for a user it cannot prove. `user_jwt` is used only
     # to read `sub` for logging/partitioning — never as a credential.
     #
     # THE DELEGATED PATH SHARES THAT PROPERTY BY A DIFFERENT ROUTE. `user_jwt` comes from
@@ -828,22 +964,21 @@ async def invoke(payload, context):
         # back LOW confidence with no sources, which looks like a broken agent
         # rather than a missing consent.
         #
-        # On the OBO path this callback should NEVER fire. If it does, the exchange
-        # silently degraded to interactive consent — which defeats the entire point of
-        # choosing OBO — so it is recorded as an ERROR rather than shown to the user.
-        # FR-5a: an OBO failure is a POLICY failure, not a consent gap, and must never
-        # be handled by prompting a user to consent to something they cannot
-        # self-grant.
+        # On the token-exchange path this callback should NEVER fire. If it does, the
+        # exchange silently degraded to interactive consent — which defeats the entire
+        # point of choosing it — so it is recorded as an ERROR rather than shown to the
+        # user. FR-5a: that is a POLICY failure, not a consent gap, and must never be
+        # handled by prompting a user to consent to something they cannot self-grant.
         def _capture(url: str, _k: str = key, _flow: str = flow) -> None:
-            if _flow == _FLOW_OBO:
+            if _flow == _FLOW_TOKEN_EXCHANGE:
                 errors[_k] = (
-                    "OBO/token-exchange unexpectedly returned an interactive consent "
-                    "URL, which means the exchange did not succeed. Treating as a "
+                    "ON_BEHALF_OF_TOKEN_EXCHANGE unexpectedly returned an interactive "
+                    "consent URL, which means the exchange did not succeed. Treating as a "
                     "policy failure, not a consent prompt (FR-5a). Check that this "
                     "resource accepts the RFC 8693 grant and that the user's IdP "
                     "token has the required scopes."
                 )
-                print(f"ERROR: source '{_k}' is configured for {_FLOW_OBO} but the "
+                print(f"ERROR: source '{_k}' is configured for {_FLOW_TOKEN_EXCHANGE} but the "
                       f"service returned a consent URL; not surfacing it to the user.",
                       flush=True)
                 return
@@ -900,13 +1035,22 @@ async def invoke(payload, context):
             print(f"ERROR: token fetch failed for source '{key}': "
                   f"{type(e).__name__}: {e}", flush=True)
 
-    connected = sorted(k for k, v in tokens.items() if v)
+    # A GATEWAY-routed source is connected when the CALLER is authenticated, because the
+    # gateway holds the source credential rather than this process. Reporting it by
+    # `tokens` alone would understate what the turn can actually reach — and would show a
+    # source as disconnected while it was answering.
+    connected = sorted(
+        k for k, v in ENABLED.items()
+        if tokens.get(k) or (v.get("via") == _VIA_GATEWAY and user_jwt)
+    )
     # A FRESH Agent per invocation — this line is what makes the turn stateless.
     # Do not hoist it to module scope to "save time": a module-level Agent would
     # accumulate conversation across DIFFERENT USERS sharing a warm container,
     # which is a cross-user data leak, not a cache. Building it is cheap; the
     # tool closure also has to re-bind this turn's per-source tokens anyway.
-    agent = _build_agent(tokens)
+    # Filled DURING the turn by the tools, not before it — see _build_agent's docstring.
+    gateway_consent: dict[str, str] = {}
+    agent = _build_agent(tokens, user_jwt, gateway_consent)
     # Stateful variant: agent(prompt) becomes agent(prompt, messages=history) —
     # see the STATEFUL block in this function's docstring.
     answer = str(agent(prompt)).strip()
@@ -922,7 +1066,13 @@ async def invoke(payload, context):
         "user": user_sub,
         "answer": answer,
         "confidence": band,
-        "connected_sources": connected,
+        # A gateway source is counted optimistically above (the caller is authenticated,
+        # so it SHOULD be reachable). If the turn then discovered it needs consent, that
+        # optimism was wrong and has to be withdrawn — otherwise the response says
+        # `connected_sources: ['github']` while the answer says GitHub could not be
+        # searched, and `ask.py` exits 0 on a fully ungrounded answer because its
+        # "nothing was searched" test reads this list. Observed exactly so.
+        "connected_sources": [k for k in connected if k not in gateway_consent],
     }
     # Consent URLs for sources this user has NOT connected yet, keyed by source.
     # A DICT, not a single `github_auth_url` string, deliberately: with four sources
@@ -930,6 +1080,11 @@ async def invoke(payload, context):
     # breaking wire-format change later. Absent entirely once everything is vaulted,
     # so a client can treat its presence as "action required from this user".
     pending = {k: u for k, u in auth_urls.items() if not tokens.get(k)}
+    # A GATEWAY-routed source's consent URL comes from the gateway itself, mid-turn, and
+    # merges into the SAME key — a client should not need to know which route a source is
+    # on to know that its user must click something. `gateway_consent` wins on collision
+    # because it is the route actually in use for that source this turn.
+    pending.update(gateway_consent)
     if pending:
         result["auth_required"] = pending
 
@@ -945,9 +1100,9 @@ async def invoke(payload, context):
 
     # Which token path each source used, so a caller can tell "the user must click
     # something" apart from "an admin must fix a grant" WITHOUT parsing error strings.
-    # An OBO source can never appear in `auth_required` (see `_capture`), so a Slack
-    # front end can show a consent button for USER_FEDERATION sources and route OBO
-    # failures to an operator instead of prompting a user who cannot self-grant.
+    # A token-exchange source can never appear in `auth_required` (see `_capture`), so a
+    # Slack front end can show a consent button for USER_FEDERATION sources and route
+    # exchange failures to an operator instead of prompting a user who cannot self-grant.
     #
     # A DELEGATED source reports its credential kind rather than an OAuth flow, because
     # calling it USER_FEDERATION would be a lie that matters: a client would render a
@@ -957,6 +1112,19 @@ async def invoke(payload, context):
         k: (_CRED_DELEGATED if v.get("credential") == _CRED_DELEGATED
             else (v.get("flow") or _FLOW_USER_FEDERATION))
         for k, v in ENABLED.items()
+    }
+
+    # WHERE each source was called from. A SEPARATE key rather than a new value inside
+    # `source_flows`, deliberately: route and flow are orthogonal (a GATEWAY source still
+    # has an OAuth flow, it is just executed elsewhere), and folding them together would
+    # both lose information and break any client already switching on `source_flows`.
+    #
+    # Useful to a caller for one concrete reason: it says who held the source token this
+    # turn, which is the difference between a source token having been present in this
+    # container's memory and not. That is an audit-relevant fact and is not derivable from
+    # anything else in the response.
+    result["source_routes"] = {
+        k: (v.get("via") or _VIA_IN_PROCESS) for k, v in ENABLED.items()
     }
     return result
 

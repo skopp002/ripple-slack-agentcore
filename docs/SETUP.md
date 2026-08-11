@@ -25,7 +25,7 @@ in `dev.env`, and keep secrets in your shell only.
 ## Part 1 — Auth0 / Okta (front-door user identity)
 
 This is the identity layer both flows share: steps `1`–`5` of
-`infra/architecture-components.png` are identical in the OBO and consent flows, and
+`infra/architecture-components.png` are identical in the delegation and consent flows, and
 they all happen here. Get this wrong and neither flow works.
 
 Create two things in the tenant:
@@ -118,7 +118,7 @@ python3 client/login.py --claims
 > consent flow that *is* implemented, and because "why not SharePoint" is a fair
 > question to ask of a knowledge assistant.
 >
-> The implemented sources are **GitHub** (consent flow) and **Google Drive** (OBO
+> The implemented sources are **GitHub** (consent flow) and **Google Drive** (delegation
 > flow), both in [`DATA-SOURCES.md`](DATA-SOURCES.md); Drive's full procedure is
 > [`GOOGLE-DRIVE-OKTA-SETUP.md`](GOOGLE-DRIVE-OKTA-SETUP.md).
 > `MS_CLIENT_SECRET` and the tenant IDs below are not referenced anywhere.
@@ -196,8 +196,10 @@ Slack token — which would be another consent-flow source alongside GitHub.
 ---
 
 ## What the code and templates create (no manual step)
-- AgentCore **Runtime** agent (Strands + Bedrock) using the AgentCore harness —
-  `infra/02-runtime.yaml`
+- AgentCore **Runtime** agent (Strands + Bedrock) using the AgentCore SDK's in-container
+  harness, `BedrockAgentCoreApp` — `infra/02-runtime.yaml`. Not to be confused with the
+  managed `AWS::BedrockAgentCore::Harness` resource below; two different things share the
+  word.
 - AgentCore **Memory** (created and injected, deliberately unused; see
   `infra/ARCHITECTURE.md` on the state model)
 - AgentCore **Identity** credential provider for GitHub (per-user OAuth, the consent
@@ -207,6 +209,31 @@ Slack token — which would be another consent-flow source alongside GitHub.
 - CLI **client** (device-flow login → sends user JWT → prints cited,
   confidence-scored answer) — `client/`
 
-Two AgentCore **Gateways** (ingress Runtime target; tools MCP target) are drawn as
-target state and are **not** deployed. They become worthwhile at roughly four
-sources; today the runtime is called directly.
+- Two AgentCore **Gateways** — `infra/03-gateways.yaml`:
+  - **ingress** — an HTTP front door with an `Http.AgentcoreRuntime` target in front of
+    the same runtime. Its outbound credential is `JWT_PASSTHROUGH`, so it forwards the
+    caller's `Authorization` header rather than substituting its own token.
+  - **tools** — an MCP server with the GitHub target on per-user `OAUTH`, `supportedVersions`
+    pinned.
+
+Both Gateways are deployed, and both are optional at call time. The client still calls
+the runtime directly by default; the ingress Gateway is a second, equivalent door rather
+than a replacement, and a source moves onto the tools Gateway one at a time with
+`<SOURCE>_VIA=GATEWAY`. Nothing breaks if you never use either.
+
+⚠️ Deploying the Gateways does **not** mean the runtime is now locked to them. The
+runtime's `AllowedWorkloadConfiguration` is deliberately left unset, because a
+`JWT_PASSTHROUGH` target never mints a Workload Access Token and so never stamps the
+workload identity chain that field introspects — setting it while the target is on
+passthrough would close the direct door *and* the Gateway door. See the mitigation notes
+in `infra/03-gateways.yaml`.
+
+- A managed AgentCore **Harness** — `infra/04-harness.yaml`, `DEPLOY_HARNESS=true`, off by
+  default. `AWS::BedrockAgentCore::Harness` runs the agent loop service-side from
+  configuration (model, system prompt, tool list, memory, iteration ceilings). Deployed and
+  answering — but it is a **second, parallel agent**, not a replacement
+  for the runtime: a harness overrides the container's `ENTRYPOINT`, so `agent/agent.py`
+  never executes there and Google Drive **cannot be served** on it. Invoke it with a bearer
+  JWT, never SigV4, and re-run `scripts/register_consent_url.py` — the harness is a third
+  workload identity, so its GitHub consent is separate again. Full detail in README step 12
+  and `CODE-WALKTHROUGH.md` § *The managed Harness route*.

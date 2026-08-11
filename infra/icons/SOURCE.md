@@ -84,8 +84,8 @@ AgentCore Observability together and the AgentCore mark is the more specific cla
 
 ## Family 3 — vendor brand marks
 
-Slack, GitHub, Auth0 and Okta are not AWS services, so no AWS icon exists for
-them. Taken from the [gilbarbara/logos](https://github.com/gilbarbara/logos)
+Slack, GitHub, Auth0, Okta and Confluence are not AWS services, so no AWS icon
+exists for them. Taken from the [gilbarbara/logos](https://github.com/gilbarbara/logos)
 collection of full-colour vendor marks, rasterised the same way:
 
 | File here | Source SVG | Note |
@@ -94,6 +94,35 @@ collection of full-colour vendor marks, rasterised the same way:
 | `github.png` | `logos/github-icon.svg` | Octocat mark |
 | `auth0.png` | `logos/auth0-icon.svg` | square logomark, not the wordmark |
 | `okta.png` | `logos/okta-icon.svg` | radial "aura" logomark, not the `okta` wordmark |
+| `confluence.png` | `logos/confluence.svg` | the blue "flowing" glyph; **not** `atlassian.svg`, which asserts the vendor rather than the product |
+
+`confluence.svg` has no `-icon` variant in the collection because the base file is
+already square-ish (400x384 after rasterising) rather than a wordmark lockup, so the
+suffix rule above does not apply to it.
+
+```bash
+curl -sLO https://raw.githubusercontent.com/gilbarbara/logos/main/logos/confluence.svg
+rsvg-convert -h 384 -a confluence.svg -o confluence.png
+```
+
+### Databricks Genie — first-party, and the product mark rather than the company
+
+`databricks-genie.png` is **Genie's own** icon, taken from Databricks' site, not the
+red Databricks corporate logo. The distinction is the rule at the top of this file:
+the tile is a Genie space reached over MCP, and the company mark would assert
+"Databricks" generally — which is wrong in a diagram whose whole subject is *which
+specific source* a token reaches. gilbarbara carries `databricks.svg` (the company
+mark) and nothing for Genie, so this one is first-party of necessity as well as
+preference:
+
+```bash
+curl -sLO https://www.databricks.com/sites/default/files/2026-03/icon-genie.svg
+rsvg-convert -h 384 -a icon-genie.svg -o databricks-genie.png
+```
+
+| File here | Source URL | Note |
+|---|---|---|
+| `databricks-genie.png` | `https://www.databricks.com/sites/default/files/2026-03/icon-genie.svg` | Genie product mark, not the Databricks corporate logo |
 
 The `-icon` suffix matters: the un-suffixed files are wide wordmarks that squash
 badly on a square tile.

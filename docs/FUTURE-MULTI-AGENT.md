@@ -86,7 +86,7 @@ Auth0 JWT → Ingress GW → Supervisor/Router (Runtime) ─┼──► Report/
 
 Key properties:
 - The **same Auth0 user JWT** propagates to every agent (identity is uniform), so
-  each agent's OBO tokens and memory namespaces are derived from one `sub`.
+  each agent's brokered tokens and memory namespaces are derived from one `sub`.
 - Agents communicate either via the **supervisor** (A2A / orchestrator calls) or
   via **shared episodic memory** (loose coupling). Prefer shared memory for
   "what happened" and direct calls for "do this now".

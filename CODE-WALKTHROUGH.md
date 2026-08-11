@@ -11,11 +11,22 @@ The design relies on two independent authorities:
 
 Ripple does not download all company documents and implement its own access-control filter. It calls Google Drive using credentials that impersonate the authenticated user, and Google Drive applies its native access-control lists.
 
-> **Terminology:** This project sometimes labels the Google path as “OBO” because it provides a no-per-user-consent experience. The implemented mechanism is specifically **Google Workspace domain-wide delegation with a delegated subject**, not an RFC 8693 token exchange.
+> **Terminology:** the Google path is **delegation** (`M2`) — specifically **Google
+> Workspace domain-wide delegation with a delegated subject**, not an RFC 8693 token
+> exchange. `agent/agent.py` reserves `ON_BEHALF_OF_TOKEN_EXCHANGE` for the exchange
+> (`M3`), which Google *cannot* do, because Google requires the assertion be signed with
+> a key we hold. The two mechanisms share the property of needing no per-user consent,
+> but that does not make them interchangeable.
 
 ## Architecture
 
-![Ripple architecture and identity flows](infra/architecture-components.png)
+![Ripple architecture and identity flows](infra/architecture-components-v3.png)
+
+> This is the current component view. It badges every hop `M1` / `M2` / `M3`, draws all
+> five target sources, and shows both flows at once — green `1a`–`14a` for `M2`
+> delegation, orange `1b`–`14b` plus `★` for `M1` consent. `infra/README.md` has the
+> per-component detail; earlier drawings are recorded under
+> [Earlier implementations](#earlier-implementations) below.
 
 The relevant Google Drive path is:
 
@@ -67,6 +78,13 @@ Example claims:
 The `email` value must be the user's Google Workspace **primary address**. Alias handling is not relied upon by this implementation.
 
 ## End-to-end walkthrough
+
+> **This walkthrough describes the AgentCore *Runtime* path (`infra/02-runtime.yaml`) — the
+> one that runs our container.** Every step below executes inside `agent/agent.py`,
+> `agent/identity_claims.py` or `agent/gdrive_tool.py`. The optional managed
+> `AWS::BedrockAgentCore::Harness` (`infra/04-harness.yaml`, README step 12) runs **none** of
+> that code: a harness overrides the container's `ENTRYPOINT`, so steps 5–14 do not happen
+> there and Google Drive cannot be served at all. See *The managed Harness route* below.
 
 ### 1. The user starts OIDC device authorization
 
@@ -626,6 +644,94 @@ The code does not fall back to:
 
 This fail-closed behavior is essential because domain-wide delegation can authorize the service account to impersonate any user within the configured Workspace domain.
 
+## The managed Harness route, and why it cannot reach Google Drive
+
+`infra/04-harness.yaml` deploys the same product as `AWS::BedrockAgentCore::Harness`: model,
+system prompt, tools, memory and iteration ceilings become configuration and **AWS runs the
+agent loop**. It is deployed and answering (`ripple_harness-5tCOqF76a2`).
+
+**It is a second, parallel agent — not a migration.** Two different things share the word
+"harness": `bedrock_agentcore.runtime.BedrockAgentCoreApp`, which `agent.py` uses, is a server
+*inside* our image. The managed Harness resource treats that image as an **environment, not an
+application** — it overrides `ENTRYPOINT` and `CMD`, so our startup command never runs,
+`@app.entrypoint` is never called, and no `@tool`-decorated Python is ever registered. A
+harness tool can only be `remote_mcp`, `agentcore_gateway`, `agentcore_browser`,
+`agentcore_code_interpreter`, or `inline_function` (which runs in the *caller*).
+
+Consequences for this document:
+
+| Step above | On the Harness |
+|---|---|
+| 1–4 (login, invoke, platform JWT validation) | same, via `AuthorizerConfiguration.CustomJWTAuthorizer` |
+| 5 (`_caller_jwt()` reads the header) | never runs — no `RequestHeaderConfiguration` exists on a harness |
+| 6–8 (`identity_claims.verified_email()`, five checks) | never runs — the platform authorizer is the only gate |
+| 9–14 (delegated subject, Drive impersonation, ACL trimming) | **not served at all** |
+
+**Google Drive is a security stop here, not a missing feature.** Two independent blockers.
+The gateway tool's outbound auth is a union of exactly `{AwsIam | None | Oauth}`, and Drive's
+mechanism is none of them: it is an assertion signed with *our* Google service-account key
+carrying the user's verified email in `sub`. And with no `RequestHeaderConfiguration`, nothing
+in the tool path can read the caller's `Authorization` header — a Gateway Lambda target does
+not help, because its invocation context carries only gateway/target/tool identifiers and no
+caller. That key holds domain-wide delegation, so the *only* thing narrowing it to one person
+is the subject we pass, which must come from a signature-verified claim (see *Fail-closed
+behavior*: "a caller-supplied plain email string" is explicitly not accepted). A Drive tool
+that cannot learn who is asking cannot narrow anything — it would silently turn a per-user
+read into a domain-wide one while every log line still looked correct. The template therefore
+ships **no** Drive tool, and `infra/02-runtime.yaml` remains the only Drive-serving path.
+
+**What else the Harness route gives up.** The five verification checks in step 6–8; the
+per-source fan-out and merge that makes "which source said this" precise; the refusal that
+hides a POLICY failure from the user; and concretely, the hard error in
+`gateway_tool.py::_scope` that makes an unscoped GitHub search impossible. On the harness the
+model calls the Gateway's tools directly, so only the **system prompt** stands between it and
+a search of all public GitHub. That prompt is consequently duplicated — `agent.py`
+`SYSTEM_PROMPT` and `SystemPrompt` in the template, because a CloudFormation template cannot
+import a Python constant — and `tests/test_harness_prompt.py` fails when a load-bearing rule
+is dropped from either copy.
+
+**Three things measured only by invoking it**, each invisible in a green stack:
+
+1. `Temperature: 0.2` passed the CFN schema and then failed *every* call with
+   `` `temperature` is deprecated for this model ``. Model parameters are validated by the
+   model at invoke time; anything added to `Model` needs a real call.
+2. The Gateway tool returns `401 Unauthorized` at load. The tools Gateway is `CUSTOM_JWT`
+   inbound, so both `AWS_IAM` and `NONE` are refused (both tested). `OAUTH` is the matching
+   value and is wired, but needs an Auth0 `client_credentials` client this project does not
+   have — an Auth0-side action. Read `AWS_IAM` as *not yet wired*. The harness does not
+   surface this to the user; it just answers at LOW confidence with no sources.
+3. SigV4 is refused outright (`This harness requires OAuth Bearer token authentication`).
+   boto3 needs the signer *disabled* (`Config(signature_version=UNSIGNED)`) before an
+   `Authorization` header survives. This matters beyond ergonomics: on a harness *without* an
+   authorizer SigV4 succeeds and stops propagating per-user identity downstream, collapsing
+   every user onto one shared credential — which is why `CustomJWTAuthorizer` is load-bearing
+   here in a way it is not on the runtime.
+
+**Two settings that are deliberate omissions.** `AllowedTools` is set explicitly because a
+harness otherwise grants `shell` **and** `file_operations` in every session — a
+document-reading agent needs neither, and a prompt injection carried inside a retrieved
+document does. And `Memory.ActorId` is left unset: pinning it would give every caller one
+shared conversation history. Per-user partitioning comes from the `actorId` argument on
+`InvokeHarness`, which is **caller-controlled** — a request field, not a claim — so the caller
+must derive it from the verified `sub`, or one user can read another's history. That is the
+header-versus-body trap `_caller_jwt()` exists to make unrepresentable, reappearing one layer
+up.
+
+**And the guardrails above are per-request defaults, not enforced limits.** On the harness,
+the configured system prompt and tool allowlist are the values used *when the caller omits
+them* — the invoke path treats them as defaults, not a ceiling. On the runtime path the
+prompt and tools are baked into the image, unreachable by the caller; this is why the harness
+cannot be the primary agent for an untrusted front door. How that difference plays out at
+invoke time was characterised separately; the summary in
+[`docs/HARNESS-ASSESSMENT.md`](docs/HARNESS-ASSESSMENT.md) states the conclusion without the
+reproduction.
+
+Finally, the harness is its **own workload identity** — `harness_ripple_harness-ejdAHhBoDB`,
+where the `harness_` prefix is literal and the service appends a random suffix, so the name
+cannot be derived. A user who connected GitHub on the runtime or on the Gateway route has not
+consented here: that is a third consent, and `scripts/register_consent_url.py` discovers this
+identity by prefix to allowlist the return URL.
+
 ## Ripple deployment context
 
 This repository is a validation implementation for Ripple, not a complete deployment inside Ripple's enterprise environment.
@@ -679,7 +785,7 @@ Ripple employee
     -> receiver posts the answer to the originating Slack thread
 ```
 
-The existing `agent/identity_claims.py` and `agent/gdrive_tool.py` path remains useful in this architecture. Ripple primarily needs to replace the CLI ingress, configure its enterprise identity systems, and confirm that the employee's `Authorization` header reaches the runtime intact across the Slack receiver and any ingress Gateway (see "Identity binding").
+The existing `agent/identity_claims.py` and `agent/gdrive_tool.py` path remains useful in this architecture. Ripple primarily needs to replace the CLI ingress, configure its enterprise identity systems, and confirm that the employee's `Authorization` header reaches the runtime intact across the Slack receiver and the ingress Gateway. The Gateway half of that is settled: the deployed target is on `JWT_PASSTHROUGH`, and a call through it resolves to the same named `sub` as a direct call, so it forwards the header rather than substituting its own credential. Note that this also requires `RequestHeaderAllowlist: ['Authorization']` on the runtime — a Slack receiver inherits that requirement (see "Identity binding").
 
 ## Work Ripple must complete
 
@@ -834,7 +940,7 @@ The receiver should pass the Slack context separately from the authorization ide
 
 These fields help route the answer but must not choose the Google delegated subject. The trusted Okta identity must choose the subject.
 
-The receiver must preserve the single-identity-channel property described under "Identity binding": the employee's Okta JWT belongs on the `Authorization` header of the AgentCore invocation, and the request body carries the question and non-authoritative Slack routing context only. If the chosen ingress cannot present a per-user JWT on that header — a SigV4-authenticated receiver, or a Gateway hop that substitutes its own credential — the delegated subject must be re-established by a mechanism the caller cannot vary, and the agent must not read an identity from the body to compensate.
+The receiver must preserve the single-identity-channel property described under "Identity binding": the employee's Okta JWT belongs on the `Authorization` header of the AgentCore invocation, and the request body carries the question and non-authoritative Slack routing context only. If the chosen ingress cannot present a per-user JWT on that header — a SigV4-authenticated receiver, or a Gateway hop that substitutes its own credential — the delegated subject must be re-established by a mechanism the caller cannot vary, and the agent must not read an identity from the body to compensate. The Gateway case is a configuration choice rather than a fact about Gateways: the deployed ingress target in `infra/03-gateways.yaml` uses `JWT_PASSTHROUGH` precisely so it forwards the caller's header, where `OAUTH` on the same target would substitute the Gateway's own token and land in the re-establish-the-subject case.
 
 ### 7. Security team: review the cross-system trust chain
 
@@ -985,7 +1091,25 @@ Two questions remain open. Each depends on how a given deployment's front door a
 
 **Inbound SigV4 authentication.** With SigV4 inbound authentication instead of `CUSTOM_JWT`, there is no user JWT on `Authorization` at all; the SDK expects the caller to supply `X-Amzn-Bedrock-AgentCore-Runtime-User-Id` instead, and says so in the error text of `_get_workload_access_token` in the SDK's `identity/auth.py` (see also the note in `agent/agent.py`). `_caller_jwt()` returns `""` in that configuration, so every delegated source is unavailable for the turn. That is fail-closed and therefore safe, but it means a SigV4 front door needs a different subject derivation before delegated sources work at all.
 
-**Traversal of an ingress Gateway.** Whether the original caller's `Authorization` header survives a hop through an AgentCore Gateway, or is replaced by the Gateway's own credential, is unverified: no Gateway is deployed in this repository, so the question has not arisen. It becomes load-bearing in the target architecture, where the Slack front door routes this way — if the Gateway substitutes its own credential, the agent would see the Gateway's identity rather than the employee's, and the delegated subject would have to be established by another mechanism.
+**Traversal of an ingress Gateway.** This question has arisen, because an ingress Gateway is now deployed — `infra/03-gateways.yaml` creates one with an `Http.AgentcoreRuntime` target in front of the same runtime, so the runtime can be reached either directly or through the hop, and both doors are open today.
+
+The header survives the hop, and it survives it *because the target was configured to make it survive*, not by accident. The target's outbound credential is `JWT_PASSTHROUGH`, whose entire behaviour is to forward the inbound `Authorization` value verbatim rather than fetch a credential of its own; the alternative, `OAUTH`, would substitute the Gateway's own token and produce exactly the substitution this note used to warn about. A call through the Gateway URL carrying a user JWT returns the same `200` as the direct call, so the header both arrives and validates against the runtime's `CUSTOM_JWT` authorizer on the far side.
+
+A **named** subject propagates, and this is now verified rather than inferred: the same user JWT sent to the Gateway URL and to the runtime directly yields the same `sub` in the response body from both. `_caller_jwt()` on the far side of the hop sees the employee's token, which is the property Drive impersonation depends on.
+
+⚠️ Getting there exposed a real defect worth recording, because the symptom pointed away from the cause. Both paths first returned `"user": "anonymous"` with a perfectly valid named JWT. The reason was neither the Gateway nor `_caller_jwt()`: the runtime's `RequestHeaderConfiguration.RequestHeaderAllowlist` was unset, and it defaults to forwarding **nothing** — not "everything except the restricted list". `Authorization` has to be named explicitly, and may be named only when a `CustomJWTAuthorizer` is configured. The authorizer still ran, so the platform authenticated every request; the header simply never reached the container. That is why the failure looked like an unconsented user rather than a misconfiguration — a `200`, no error, `connected_sources: []`. `infra/02-runtime.yaml` now sets the allowlist, and the comment there explains why nothing else belongs on it.
+
+⚠️ One consequence of choosing `JWT_PASSTHROUGH` is not about headers at all: a passthrough target never mints a Workload Access Token, so it never stamps the workload identity chain that the runtime's `AllowedWorkloadConfiguration` introspects. Setting that field while the target is on passthrough would close the direct door *and* the Gateway door. The two settings are one change, not two — see the mitigation notes in `infra/03-gateways.yaml` and the parameter description in `infra/02-runtime.yaml`.
+
+**The tools Gateway asks the same user to consent a second time.** This is a different Gateway and a different mechanism from the ingress hop above, and it matters to anyone moving a source onto `via: GATEWAY`. A vaulted OAuth token belongs to the *workload* that vaulted it. The runtime has one workload identity and the tools Gateway has another, so the token a user vaulted through `client/consent.py` grants the Gateway's target nothing: the same user must approve the same source again for the Gateway route. That follows from the property the route exists for — this container never holds a source token, so it cannot lend the Gateway one — rather than from a gap to be closed.
+
+The Gateway signals it as an MCP **elicitation**, not an HTTP `401`: JSON-RPC error `-32042` with an AgentCore authorize URL in `data.elicitations[i].url`. Ripple merges that into the same `auth_required` field as any other consent, so a client never needs to know which route a source is on. Three defects surfaced only by running this route against the deployment, all fixed:
+
+- **The consent URL was discarded.** `McpError.__str__` is only "This request requires more information.", so the URL was present on the object and invisible in every log line. It was re-raised generically and reported as `ExceptionGroup searching GitHub via the gateway`, which reads as broken plumbing — a debugging session went after the MCP transport while the true state was "reachable, authenticated, awaiting one click". `agent/gateway_tool.py` now raises a distinct `ElicitationRequired` carrying the URL, and unwraps it from the anyio `ExceptionGroup` that `streamablehttp_client` produces (a plain `except` on the exception type does not match a group — that unwrapping is what makes the type usable). `tests/test_gateway_elicitation.py` holds both properties.
+- **The redirect landed nowhere.** The loopback return URL was allowlisted on the runtime's workload identity only, so after approving, the browser showed "This site can't be reached" with no error anywhere in AWS. `scripts/register_consent_url.py` now registers both.
+- **The Gateway route searched all public GitHub.** The target's OpenAPI schema exposed `/user/orgs` and `/search/code` but not `/user`, so the `user:<login>` half of the scope was unobtainable and an account in no organizations computed an *empty* scope. The first live search cited `crestalnetwork/intentkit`, `vaquarkhan/vaquarkhan` and `RuntimeTools/appmetrics` — strangers' repositories, correctly permission-trimmed and useless. This is precisely the relevance regression `agent/gateway_tool.py`'s scoping note warns a Gateway target can cause, observed rather than predicted; the in-process route never had it because it calls `GET /user` directly. The schema now exposes `/user`, and an empty scope is a hard error on this route instead of a silent degradation to global search.
+
+With those fixed the route works end to end and answers at HIGH confidence, which is better than this document previously predicted. The reason is that routing is **per operation**: only `search` moves to the Gateway, while `read_company_document` stays in-process, so the model recovers the text-match snippets an OpenAPI target cannot request by reading a promising hit in full. That recovery depends on the in-process credential also being present — a user who consented *only* to the Gateway has search but no `fetch`, and those answers do degrade to LOW. GitHub still defaults to `IN_PROCESS`: one consent rather than two, and one fewer round trip.
 
 ## Security properties
 
@@ -1010,6 +1134,10 @@ The design provides:
 | `agent/agent.py` | Runtime entrypoint, delegated-source selection, and verified subject propagation. |
 | `agent/identity_claims.py` | OIDC discovery, JWKS verification, email verification, and domain allowlisting. |
 | `agent/gdrive_tool.py` | Google domain-wide delegation, user impersonation, Drive search, and document retrieval. |
+| `agent/gateway_tool.py` | Tools Gateway route over MCP: per-user calls where the Gateway holds the source token, scope composition, and the second consent an elicitation asks for. |
+| `infra/04-harness.yaml` | Optional managed agent (`AWS::BedrockAgentCore::Harness`): model, system prompt, tool list, memory and iteration ceilings as configuration. Runs none of `agent/`, and serves no Google Drive. |
+| `tests/test_harness_prompt.py` | Guards the system prompt duplicated between `agent.py` and `infra/04-harness.yaml`, and that the harness keeps no shell and no shared memory partition. |
+| `scripts/register_consent_url.py` | Allowlists the consent return URL on every workload identity that redirects a browser — the runtime's, the tools Gateway's, and the harness's. |
 | `docs/GOOGLE-DRIVE-OKTA-SETUP.md` | Google Workspace and delegated-service-account setup. |
 | `docs/DATA-SOURCES.md` | Source onboarding for all five sources: credential kind, flow, and status per source, plus the recipe for adding one. |
 
@@ -1017,4 +1145,17 @@ The design provides:
 
 Ripple's Google Drive integration uses a verified OIDC identity to select a Google Workspace delegated subject. The Google service account signs an assertion containing that subject and a read-only Drive scope. Google then issues a token representing the user and applies the user's existing Drive permissions to every search and document read.
 
-The Google delegation and native ACL-trimming model is sound, and the identity used for delegation is bound to the identity AgentCore authenticated because both are the same `Authorization` header value. Two deployment-specific questions remain to be settled before a production front door: a SigV4-authenticated ingress presents no user JWT on `Authorization`, so it needs a different subject derivation; and whether the caller's `Authorization` header survives a hop through an ingress Gateway is unverified, which matters for the Slack front door in the target architecture.
+The Google delegation and native ACL-trimming model is sound, and the identity used for delegation is bound to the identity AgentCore authenticated because both are the same `Authorization` header value. The ingress Gateway question is settled: its target is on `JWT_PASSTHROUGH`, and the same JWT sent through the Gateway and sent directly resolves to the same named `sub`, so the hop preserves identity rather than substituting the Gateway's own. Reaching that required setting `RequestHeaderAllowlist: ['Authorization']` on the runtime — without it the header reaches no container on either path.
+
+One deployment-specific question remains before a production front door: a SigV4-authenticated ingress presents no user JWT on `Authorization` at all, so it needs a different subject derivation. `_caller_jwt()` returns `""` there and every delegated source is simply unavailable, which is fail-closed and safe but not functional.
+
+The managed Harness route is deployed alongside this and answers correctly from the same system prompt, but it is additive rather than a replacement: it runs none of the code walked through above, and the same absence — no way to read the caller's `Authorization` header — is what makes Google Drive unservable there. Whichever front door Ripple builds, the delegated-subject property depends on a verified claim reaching the code that signs the Google assertion.
+
+## Earlier implementations
+
+Everything above describes the **current** implementation. The two superseded component diagrams are kept only as a record of what the drawing used to claim — do not read them as alternatives to the current design:
+
+- `infra/architecture-components.png` (v1) labels the Google Drive path **"OBO"**. That name is retired: in `agent/agent.py` "OBO" now means the RFC 8693 *token exchange* (`M3`), while Drive is *delegation* (`M2`). Read v1's green arrows as `M2`. It also predates the second Gateway and the five-source target picture.
+- `infra/architecture-components-v2.png` (v2) is an intermediate view without the `M1`/`M2`/`M3` hop badges.
+
+The current view is `infra/architecture-components-v3.png`, rendered by `infra/render_components_v3.py`. The older `infra/render_components.py` and `infra/render_components_v2.py` still run, but emit the historical views — use them only to reproduce a past diagram, never to update the current one. `infra/README.md` has the full version table.

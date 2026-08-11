@@ -25,10 +25,10 @@ four-step recipe is at the end of this file.
 | Source | Credential kind | Flow | Status | Who sets it up |
 |---|---|---|---|---|
 | **GitHub** | `VAULTED_OAUTH` | consent (`USER_FEDERATION`) | **Implemented** | Whoever deploys registers one OAuth App they own — no org admin. Then one consent click per end user, per source, once. |
-| **Google Drive / Docs** | `DELEGATED_SUBJECT` | OBO (no consent screen) | **Implemented** | Google Workspace **super-admin**, once (domain-wide delegation). End users do nothing. |
-| **Databricks Genie** (MCP) | `VAULTED_OAUTH` | OBO if fronted by an IdP-guarded MCP server; consent otherwise | Target state — **not implemented** | Platform/IdP admin (app registration + audience + AgentCore credential provider) |
-| **Confluence** | `VAULTED_OAUTH` | consent by default; OBO only if confirmed | Target state — **not implemented** | Atlassian admin for the OAuth app; then one consent click per end user |
-| **Slack** (as a data source) | `VAULTED_OAUTH` | consent by default; OBO only if confirmed | Target state — **not implemented** | Slack Workspace admin for the app; then one consent click per end user |
+| **Google Drive / Docs** | `DELEGATED_SUBJECT` | delegation, `M2` (no consent screen) | **Implemented** | Google Workspace **super-admin**, once (domain-wide delegation). End users do nothing. |
+| **Databricks Genie** (MCP) | `VAULTED_OAUTH` | token exchange (`M3`) if fronted by an IdP-guarded MCP server; consent otherwise | Target state — **not implemented** | Platform/IdP admin (app registration + audience + AgentCore credential provider) |
+| **Confluence** | `VAULTED_OAUTH` | consent by default; token exchange only if confirmed | Target state — **not implemented** | Atlassian admin for the OAuth app; then one consent click per end user |
+| **Slack** (as a data source) | `VAULTED_OAUTH` | consent by default; token exchange only if confirmed | Target state — **not implemented** | Slack Workspace admin for the app; then one consent click per end user |
 
 Credential kinds and flows above come from `SOURCES` and `_flow_for()` in
 `agent/agent.py`. The three target-state rows exist there only as commented-out
@@ -41,16 +41,23 @@ search source cannot answer anything under strict grounding.
 
 ---
 
-## The two flows
+## The flows
 
-**Consent — `USER_FEDERATION`.** Three-legged OAuth. The user clicks once, per
+Two flows are *drawn* — consent and no-consent — but there are **three mechanisms**,
+because the no-consent outcome is reached two incompatible ways. `M1` / `M2` / `M3` below
+are the same labels the current component diagram badges every hop with.
+
+**Consent (`M1`) — `USER_FEDERATION`.** Three-legged OAuth. The user clicks once, per
 source, per lifetime; AgentCore Identity vaults a refresh token server-side and every
 later question finds it without a consent screen. Works against any OAuth2 provider,
 which is why it is the default. Diagram:
 [`../infra/architecture-consent-flow.png`](../infra/architecture-consent-flow.png).
 
-**OBO — `ON_BEHALF_OF_TOKEN_EXCHANGE`, or a delegated subject.** No consent screen
-ever appears. Two distinct shapes reach that outcome:
+**No consent screen — two different mechanisms, and they are not interchangeable.** One
+is a token exchange (`M3`), the other a delegated subject (`M2`). They share only the
+*outcome*, which is why this document once called both "OBO" and why it no longer does:
+that name is reserved for `ON_BEHALF_OF_TOKEN_EXCHANGE` — the exchange alone — in
+`agent/agent.py`, so using it for Google Drive named a mechanism Drive cannot use.
 
 - **RFC 8693 token exchange** — the user's IdP JWT is exchanged for a token at the
   resource. Requires both the IdP *and* the resource to support the exchange grant.
@@ -61,18 +68,20 @@ ever appears. Two distinct shapes reach that outcome:
   delegated source can reach any user in the domain, its subject must come from
   `identity_claims.verified_email()` — signature, issuer and audience all checked.
 
-Diagram: [`../infra/architecture-obo-flow.png`](../infra/architecture-obo-flow.png).
+Diagram (the delegated-subject shape, which is the one that runs today):
+[`../infra/architecture-delegation-flow.png`](../infra/architecture-delegation-flow.png).
 
 **Which flow a source uses is configuration, not code.** `_flow_for()` reads
 `<SOURCE>_AUTH_FLOW` and defaults to `USER_FEDERATION`; that is requirement **FR-34**
 — a source must be migratable between paths with no code change.
 
-**The failure mode is hard, not graceful.** OBO is not universally available, and an
-unsupported grant is an error from the vendor's token endpoint rather than a fallback
-to consent. Verified empirically: **GitHub returns
-`{"error": "unsupported_grant_type"}` for the token-exchange grant, so GitHub cannot
-use OBO** no matter how identity is arranged. Never set a source's flow to OBO without
-first confirming against that vendor's token endpoint that the exchange is accepted.
+**The failure mode is hard, not graceful.** The token exchange is not universally
+available, and an unsupported grant is an error from the vendor's token endpoint rather
+than a fallback to consent. Verified empirically: **GitHub returns
+`{"error": "unsupported_grant_type"}` for the token-exchange grant, so GitHub cannot use
+it** no matter how identity is arranged. Never set a source's flow to
+`ON_BEHALF_OF_TOKEN_EXCHANGE` without first confirming against that vendor's token
+endpoint that the exchange is accepted.
 
 ---
 
@@ -184,7 +193,7 @@ step repeats. See
 
 ---
 
-## Google Drive — implemented, OBO flow
+## Google Drive — implemented, delegation flow (`M2`)
 
 Drive is the source with **no consent screen at any step**. It is
 `DELEGATED_SUBJECT`: there is no per-user Drive token to vault, because only Google
@@ -223,8 +232,8 @@ before any Ripple code depends on it:
 
 ## The three MCP sources — target state, not implemented
 
-Databricks Genie, Confluence and Slack are the customer's other sources, and the
-customer's current architecture already fans out to four MCP servers. **None of the
+Databricks Genie, Confluence and Slack are Ripple's other sources, and Ripple's
+current architecture already fans out to four MCP servers. **None of the
 three is implemented here.** In this repo they exist as commented-out rows in
 `SOURCES` and as design notes in
 [`../infra/ARCHITECTURE.md`](../infra/ARCHITECTURE.md). There are no setup steps to
@@ -234,7 +243,8 @@ unresolved.
 
 Two facts apply to all three.
 
-**An IdP-guarded MCP server is where the OBO code path would first actually run.**
+**An IdP-guarded MCP server is where the token-exchange code path would first actually
+run.**
 Register the MCP server as an app in the IdP with its own audience, and register it in
 AgentCore as a `customOauth2ProviderConfig` with
 `onBehalfOfTokenExchangeConfig.grantType = TOKEN_EXCHANGE`. That would be the first
@@ -247,22 +257,23 @@ member. Nothing in the repo runs this today.
 **Whether a given vendor accepts the exchange grant has to be confirmed against that
 vendor.** There is no capability document to consult, the answer is per-vendor, and
 the failure is a hard error from the token endpoint rather than a fallback to consent.
-Confirm it before committing a source to the OBO path — not after.
+Confirm it before committing a source to the token-exchange path — not after.
 
 ### Databricks Genie
 
 - **Credential kind:** `VAULTED_OAUTH`. Genie is reached over MCP under the user's own
   token, not by impersonating the user by name, so it is not `DELEGATED_SUBJECT`.
-- **Flow:** OBO is the reason to prefer an MCP front door — an MCP server registered in
+- **Flow:** the token exchange is the reason to prefer an MCP front door — an MCP server registered in
   the IdP with its own audience is exactly the shape described above. Absent that, the
   default `USER_FEDERATION` consent path applies.
 - **Must exist first:** the MCP server itself and its IdP app registration; an
   AgentCore credential provider for it (a resource alongside `GithubProvider` in
   [`../infra/02-runtime.yaml`](../infra/02-runtime.yaml)); a `search_genie` callable in
-  the agent; and an MCP client path in the runtime, which does not exist — the Tools
-  Gateway is drawn as target state and is not deployed.
+  the agent; and an MCP client path in the runtime. The Tools Gateway itself is deployed
+  (`../infra/03-gateways.yaml`) with the GitHub target live, so registering Genie as a
+  second target is the incremental step rather than standing up new infrastructure.
 - **Unresolved:** whether Databricks' token endpoint accepts the token-exchange grant,
-  and therefore whether this source can be on OBO at all. Also unresolved: what a Genie
+  and therefore whether this source can be on the exchange at all. Also unresolved: what a Genie
   result maps onto in the `search` / `fetch` / `inventory` shape, since Genie answers
   questions over data rather than returning documents.
 
@@ -272,7 +283,7 @@ Confirm it before committing a source to the OBO path — not after.
   AgentCore Identity would broker and vault.
 - **Flow:** consent (`USER_FEDERATION`) unless and until Atlassian's token endpoint is
   confirmed to accept the exchange grant. The default is deliberate: consent works
-  against any OAuth2 provider, whereas an unverified OBO assumption fails at the first
+  against any OAuth2 provider, whereas an unverified token-exchange assumption fails at the first
   question.
 - **Must exist first:** an OAuth app on the Atlassian side, its credential provider
   resource, the callback URL pasted back into that app after the first deploy (the same
@@ -285,7 +296,7 @@ Confirm it before committing a source to the OBO path — not after.
 
 - **Credential kind:** `VAULTED_OAUTH` — searched under the user's own Slack token, so
   Slack's own channel and DM membership does the trimming.
-- **Flow:** consent (`USER_FEDERATION`), same reasoning as Confluence; OBO only on
+- **Flow:** consent (`USER_FEDERATION`), same reasoning as Confluence; token exchange only on
   confirmation against Slack's token endpoint.
 - **Must exist first:** a Slack app in the workspace, its credential provider resource
   and callback URL, scopes injected, and a `search_slack` callable.
@@ -322,8 +333,11 @@ The recipe, from the comment above `SOURCES` in
 
 Two consequences worth knowing.
 
-**Four sources is where a Tools Gateway starts to pay for itself.** At that point an
-AgentCore Gateway with MCP fan-out stops being optional — see
+**Four sources is where a Tools Gateway starts to pay for itself.** The Gateway is
+deployed already (`infra/03-gateways.yaml`, MCP, `supportedVersions` pinned, GitHub
+target live), but routing through it is opt-in per source via `<SOURCE>_VIA=GATEWAY`, and
+in-process brokering stays the default. Around the fourth source the argument flips and
+the fan-out is what you want by default rather than the exception — see
 [`../infra/ARCHITECTURE.md`](../infra/ARCHITECTURE.md). However the tools are routed,
 per-user permission trimming must stay enforced by each source via that user's own
 token: never a service account, never filtering of our own.
@@ -331,3 +345,21 @@ token: never a service account, never filtering of our own.
 **A source with absent environment variables is skipped, not fatal.** So one template
 deploys a GitHub-only stack and a multi-source stack with no code change and no
 template fork.
+
+### The recipe above does not apply to the managed Harness
+
+If the source also has to be reachable from `infra/04-harness.yaml`'s
+`AWS::BedrockAgentCore::Harness` (opt-in; README step 12), none of steps 1–4 help. A harness
+overrides the container's `ENTRYPOINT`, so `agent/agent.py` never runs and the `SOURCES` dict
+is never read there. A harness tool is one of exactly five kinds — `remote_mcp`,
+`agentcore_gateway`, `agentcore_browser`, `agentcore_code_interpreter`, `inline_function` —
+so the source must be reached through the tools Gateway (or its own MCP endpoint) and declared
+in the template's `Tools` list *and* in `AllowedTools`.
+
+That is also why **`DELEGATED_SUBJECT` sources cannot be served on the harness at all.** A
+gateway tool's outbound auth is a union of exactly `{AwsIam | None | Oauth}`, none of which is
+"an assertion we sign ourselves", and a harness has no `RequestHeaderConfiguration`, so nothing
+in the tool path can read the caller's `Authorization` header to learn *which* user to
+impersonate. For Drive that turns a per-user read into a domain-wide one, so the template
+carries no Drive tool. `VAULTED_OAUTH` sources are the ones that port — and each brings a
+**third consent**, because the harness is its own workload identity.

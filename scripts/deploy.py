@@ -21,8 +21,44 @@ Everything is now CloudFormation:
                          already exists. This is the ONE imperative step, and it
                          creates nothing — it only puts an image in a declared repo.
     02-runtime.yaml      Memory + Identity provider + role + Runtime + Endpoint
+    03-gateways.yaml     Ingress Gateway + Tools Gateway + targets   <- OPT-IN,
+                         via DEPLOY_GATEWAYS=true. Off by default because the
+                         runtime is directly invocable without it and the default
+                         route for every source is still in-process, so a gateway
+                         that nothing uses is cost and surface with no benefit.
+    04-harness.yaml      MANAGED AgentCore Harness (AWS runs the agent loop)
+                         <- OPT-IN, via DEPLOY_HARNESS=true, and it needs
+                         DEPLOY_GATEWAYS too because its only tool is the tools
+                         gateway.
 
-This script only sequences those three and threads the image tag between them.
+⚠️ DO NOT USE 04 (the harness) AS THE DEPLOYED AGENT FOR NOW — use the runtime route.
+It is a deployed EXPERIMENT: InvokeHarness lets the caller override the system prompt and
+tool allowlist, and it cannot serve Google Drive. docs/HARNESS-ASSESSMENT.md has the
+measured evidence.
+
+⚠️ THE STACKS ARE CUMULATIVE, NOT EITHER/OR. DEPLOY_HARNESS=true does NOT swap the harness
+in for the runtime — 01 and 02 always deploy, 03 deploys if DEPLOY_GATEWAYS=true, and 04 is
+ADDED on top (and requires 03). Turning the harness on only appends a parallel agent; it
+never skips or replaces 02.
+
+⚠️ 04 IS A SECOND, PARALLEL AGENT — NOT A REPLACEMENT FOR 02. It is easy to read
+"use the harness to manage the agent" as "02 goes away", and that would silently
+delete the only path that serves Google Drive. A Harness OVERRIDES the container's
+ENTRYPOINT/CMD, so agent/agent.py never runs on it: no in-process tools, and no
+`Authorization` header to read (Harness has no RequestHeaderConfiguration), which is
+exactly what the Drive path needs to pin impersonation to a verified email. So both
+stacks coexist deliberately, and this script never destroys 02 on behalf of 04. See
+infra/04-harness.yaml's header for the full accounting of what does and does not
+migrate.
+
+THE GATEWAY STACK NEEDS TWO PASSES, and the second is not optional if you want the
+gateway to be more than decorative. 03-gateways.yaml imports the runtime ARN from
+02-runtime.yaml, and 02-runtime.yaml's AllowedWorkloadConfiguration needs the ingress
+gateway's ARN to stop callers bypassing the gateway. That is circular, so this script
+deploys 03, reads its IngressGatewayArn, and re-deploys 02 with it. Between those two
+points the bypass is open; the script says so rather than leaving it implicit.
+
+This script only sequences those stacks and threads the image tag between them.
 It creates no AWS resource itself, so `aws cloudformation deploy` by hand (see
 infra/README.md) remains a fully supported equivalent — nothing here is required
 magic.
@@ -82,6 +118,8 @@ INFRA = os.path.join(SOLUTION, "infra")
 
 FOUNDATION_STACK = optional_env("FOUNDATION_STACK") or "ripple-foundation"
 RUNTIME_STACK = optional_env("RUNTIME_STACK") or "ripple-runtime"
+GATEWAY_STACK = optional_env("GATEWAY_STACK") or "ripple-gateways"
+HARNESS_STACK = optional_env("HARNESS_STACK") or "ripple-harness"
 AGENT_NAME = optional_env("AGENTCORE_AGENT_NAME") or "ripple"
 
 
@@ -161,7 +199,7 @@ def preflight(dry: bool) -> None:
 
     # A name inside a stack we are about to update is not a conflict — it is ours.
     managed: set[str] = set()
-    for stack in (FOUNDATION_STACK, RUNTIME_STACK):
+    for stack in (FOUNDATION_STACK, RUNTIME_STACK, GATEWAY_STACK):
         try:
             for p in cfn.get_paginator("list_stack_resources").paginate(StackName=stack):
                 for r in p["StackResourceSummaries"]:
@@ -218,6 +256,32 @@ def preflight(dry: bool) -> None:
          any(p.get("name") == f"{AGENT_NAME}-github"
              for p in acp.list_oauth2_credential_providers()
              .get("credentialProviders", []))),
+        # 03-gateways.yaml's fixed names. Checked unconditionally even though the stack
+        # is opt-in: a conflict reported on a run that skips the stack is noise the
+        # summary already labels by stack, whereas a MISSED conflict is a mid-deploy
+        # rollback. Gateway names are fixed (`<agent>-ingress`, `<agent>-tools`); the
+        # gateway ids and target ids are service-generated and cannot collide.
+        ("03-gateways", f"iam role Ripple{AGENT_NAME}GatewayRole",
+         _exists(iam.get_role, RoleName=f"Ripple{AGENT_NAME}GatewayRole")),
+        ("03-gateways", f"gateway named {AGENT_NAME}-ingress",
+         any(g.get("name") == f"{AGENT_NAME}-ingress"
+             for g in acp.list_gateways().get("items", []))),
+        ("03-gateways", f"gateway named {AGENT_NAME}-tools",
+         any(g.get("name") == f"{AGENT_NAME}-tools"
+             for g in acp.list_gateways().get("items", []))),
+        # 04-harness.yaml. Underscore, not hyphen: a harness name matches
+        # ^[a-zA-Z][a-zA-Z0-9_]{0,39}$ and rejects the `-` every other resource here
+        # uses, so this name cannot be built by the same f-string pattern as the rest.
+        ("04-harness", f"iam role Ripple{AGENT_NAME}HarnessRole",
+         _exists(iam.get_role, RoleName=f"Ripple{AGENT_NAME}HarnessRole")),
+        # ⚠️ Also catches the runtime a PREVIOUS harness provisioned for itself. A
+        # harness owns a runtime named `harness_<harnessName>`, which is how a
+        # harness-shaped runtime and log group appear in the account with nobody having
+        # created one. Deleting the harness deletes it; deleting that runtime by hand
+        # leaves the harness pointing at nothing.
+        ("04-harness", f"harness named {AGENT_NAME}_harness",
+         any(h.get("harnessName") == f"{AGENT_NAME}_harness"
+             for h in acp.list_harnesses().get("harnesses", []))),
     ]
 
     conflicts = []
@@ -310,6 +374,48 @@ def main() -> int:
     # asserts it too (Rules: DriveRequiresDomainAllowlist), but failing here is
     # kinder: no image build, no changeset, and the message can name the env var.
     allowed_domains = optional_env("ALLOWED_EMAIL_DOMAINS") or ""
+    # OPT-IN. The gateways are real resources with their own cost and attack surface, and
+    # nothing requires them: the runtime is directly invocable and every source's default
+    # route is in-process. Deploying them by default would create infrastructure most
+    # runs do not use.
+    deploy_gateways = (optional_env("DEPLOY_GATEWAYS") or "").lower() in (
+        "1", "true", "yes")
+    # OPT-IN, and ADDITIVE. Turning this on does not turn 02 off — see the module
+    # docstring. The harness is a separate agent with its own front door, its own
+    # workload identity, and no Google Drive.
+    deploy_harness = (optional_env("DEPLOY_HARNESS") or "").lower() in (
+        "1", "true", "yes")
+    if deploy_harness:
+        # Not an error — the experiment is deliberately runnable — but the harness must not
+        # be mistaken for the deploy path. See docs/HARNESS-ASSESSMENT.md.
+        print("\n🛑 NOTE: DEPLOY_HARNESS=true deploys the EXPERIMENTAL managed harness.\n"
+              "  Do not use it as the deployed agent for now — the runtime route (02) is the\n"
+              "  supported path. InvokeHarness lets the caller override the system prompt and\n"
+              "  tool allowlist, and the harness cannot serve Google Drive. The runtime stack\n"
+              "  below is deployed regardless; this only ADDS a parallel agent.\n",
+              file=sys.stderr)
+    # Where a `via: GATEWAY` source sends its calls. Always passed to the runtime stack
+    # (empty included) for the same stored-value reason as GOOGLE_SA_SECRET_ARN. When the
+    # gateway stack is deployed in this run, the freshly-read URL overrides whatever is in
+    # the environment — the deployed gateway is the authoritative answer.
+    tools_gateway_url = optional_env("RIPPLE_TOOLS_GATEWAY_URL") or ""
+    github_via = optional_env("GITHUB_VIA") or ""
+    if github_via.upper() == "GATEWAY" and not (deploy_gateways or tools_gateway_url):
+        print("\nERROR: GITHUB_VIA=GATEWAY but no tools gateway is available.\n"
+              "  Either set DEPLOY_GATEWAYS=true to create one, or set "
+              "RIPPLE_TOOLS_GATEWAY_URL\n  to an existing gateway. (The agent would "
+              "otherwise fall back to in-process at\n  startup with a warning, which "
+              "works but is not what you asked for.)", file=sys.stderr)
+        return 2
+    if deploy_harness and not deploy_gateways:
+        print("\nERROR: DEPLOY_HARNESS=true but DEPLOY_GATEWAYS is not set.\n"
+              "  The harness's ONLY tool is the tools gateway (it cannot have "
+              "in-process tools —\n  a Harness overrides the container entrypoint, so "
+              "agent.py never runs). Without the\n  gateway it would deploy cleanly and "
+              "then answer every question with no sources at\n  all, which reads as a "
+              "model problem rather than a missing stack.\n"
+              "  Set DEPLOY_GATEWAYS=true.", file=sys.stderr)
+        return 2
     if google_sa_arn and not allowed_domains:
         print("\nERROR: GOOGLE_SA_SECRET_ARN is set (Drive enabled) but "
               "ALLOWED_EMAIL_DOMAINS is not.\n"
@@ -357,6 +463,9 @@ def main() -> int:
         # STORED value for any omitted parameter, so narrowing the allowlist by
         # unsetting the var has to actually narrow it.
         "AllowedEmailDomains": allowed_domains,
+        # Always passed, empty included — same stored-value reason as the two above.
+        "ToolsGatewayUrl": tools_gateway_url,
+        "GithubVia": github_via,
     }
     trust_unverified = (optional_env("TRUST_UNVERIFIED_EMAIL_CLAIM") or "").lower()
     if trust_unverified in ("1", "true", "yes"):
@@ -374,6 +483,101 @@ def main() -> int:
         runtime_params["GithubClientSecretArn"] = secret_arn
     deploy_stack(RUNTIME_STACK, "02-runtime.yaml", runtime_params, args.dry_run)
 
+    # ---- 03-gateways.yaml, plus the second pass over 02 -------------------------
+    # Opt-in, and skipped under --image-only (rolling an image does not change either
+    # gateway; re-running this would only re-assert the same configuration).
+    if deploy_gateways and not args.image_only:
+        deploy_stack(GATEWAY_STACK, "03-gateways.yaml",
+                     {"RuntimeStackName": RUNTIME_STACK,
+                      "AgentName": AGENT_NAME,
+                      "ProjectTagValue": tags.TAG_VALUE,
+                      "Auth0Domain": auth0_domain,
+                      "Auth0Audience": auth0_audience,
+                      "GithubScopes": github_scopes,
+                      # Same value 02 gets, from the same import. The gateway's GitHub
+                      # target needs it because its grant type is AUTHORIZATION_CODE,
+                      # and it must MATCH the runtime's: two different return URLs
+                      # would mean consent granted on one route never completes on
+                      # the other.
+                      "ConsentReturnUrl": CONSENT_RETURN_URL,
+                      # Same ARN 02 got, and for a reason that is invisible from this
+                      # stack: 02 runs ClientSecretSource=EXTERNAL, so AgentCore reads
+                      # the OAuth client secret AS THE CALLER. The gateway role needs
+                      # its own read grant or the first GitHub tool call dies with
+                      # AccessDenied. Passed from the SAME variable as the runtime
+                      # stack's, so the two grants cannot name different secrets.
+                      "GithubClientSecretArn": secret_arn},
+                     args.dry_run)
+
+        if not args.dry_run:
+            gw = stack_outputs(GATEWAY_STACK)
+            ingress_arn = gw.get("IngressGatewayArn") or ""
+            tools_url = gw.get("ToolsGatewayUrl") or ""
+
+            # SECOND PASS, for the TOOLS gateway URL only: without the gateway's real
+            # URL a GATEWAY-routed source falls back to in-process, which works and is
+            # not what was asked for.
+            #
+            # ⚠️ IngressGatewayArn is READ ABOVE AND DELIBERATELY NOT PASSED. It was,
+            # originally — this pass existed to close the gateway bypass by feeding
+            # 02's AllowedWorkloadConfiguration. Passing it TODAY makes the runtime 401
+            # on EVERY path, the gateway's included, because the ingress target is on
+            # JWT_PASSTHROUGH and a passthrough target never mints the WAT that stamps
+            # the workload identity chain that field introspects. Adding it back here on
+            # its own is the single easiest way to take this deployment down.
+            #
+            # It is a TWO-part change, not a broken feature: an otherwise-identical
+            # gateway on OAUTH outbound does pass the check (proven), so flipping the
+            # ingress target's credential type is the prerequisite, and the reason that
+            # has not been done is a claim trade-off (M2 needs `email` in the token).
+            # Evidence and correct test method: 03-gateways.yaml, IngressGateway comment,
+            # mitigation (2). UNTIL THEN THE GATEWAY BYPASS IS OPEN, knowingly.
+            if tools_url:
+                print("\n=== second pass over the runtime stack")
+                print("  Required because 02 and 03 depend on each other: 03 imports "
+                      "the runtime ARN, and\n  02 needs the tools gateway's URL. Only "
+                      "the URL is passed back — the ingress gateway\n  ARN is read and "
+                      "not passed; see the comment above for the two-part change that\n"
+                      "  would close the direct-invoke bypass.")
+                if tools_url:
+                    # The deployed gateway wins over whatever the environment said.
+                    runtime_params["ToolsGatewayUrl"] = tools_url
+                deploy_stack(RUNTIME_STACK, "02-runtime.yaml", runtime_params, False)
+
+    # ---- 04-harness.yaml --------------------------------------------------------
+    # Last, because it imports the tools gateway ARN from 03. Skipped under
+    # --image-only: the harness does not run our image at all, so a new image tag is
+    # not a reason to touch it. That is the clearest single symptom of what a Harness
+    # is — `--image-only` is a no-op for it.
+    if deploy_harness and not args.image_only:
+        harness_params = {
+            "GatewayStackName": GATEWAY_STACK,
+            "RuntimeStackName": RUNTIME_STACK,
+            "AgentName": AGENT_NAME,
+            "ProjectTagValue": tags.TAG_VALUE,
+            "BedrockModelId": model_id,
+            "Auth0Domain": auth0_domain,
+            "Auth0Audience": auth0_audience,
+            "GithubScopes": github_scopes,
+            # Same value 02 and 03 get. The harness is a THIRD workload identity, so it
+            # drives its own consent, but the return URL must still be the one URL our
+            # client actually serves.
+            "ConsentReturnUrl": CONSENT_RETURN_URL,
+        }
+        # Closes FR-18. The runtime provisions Memory and never reads it; the harness
+        # takes an ARN and AWS does the reading and writing. Passed only when the
+        # runtime stack actually produced one — an empty MemoryArn makes the template
+        # set Disabled:{} explicitly rather than leave memory unconfigured.
+        if not args.dry_run:
+            mem_arn = stack_outputs(RUNTIME_STACK).get("MemoryArn") or ""
+            if mem_arn:
+                harness_params["MemoryArn"] = mem_arn
+            else:
+                print("\n  NOTE: runtime stack exports no MemoryArn, so the harness "
+                      "deploys with memory\n  DISABLED (sessions still work; they just "
+                      "do not persist across invocations).")
+        deploy_stack(HARNESS_STACK, "04-harness.yaml", harness_params, args.dry_run)
+
     if args.dry_run:
         print("\n(dry-run) would then print stack outputs and apply tags.")
         return 0
@@ -383,6 +587,44 @@ def main() -> int:
     print(f"  export RIPPLE_RUNTIME_ARN={out.get('RuntimeArn', '?')}")
     print(f"  export RIPPLE_RUNTIME_QUALIFIER={out.get('EndpointName', '?')}")
     print(f"  export AGENTCORE_MEMORY_ID={out.get('MemoryId', '?')}")
+    if deploy_gateways and not args.image_only:
+        gw_out = stack_outputs(GATEWAY_STACK)
+        print(f"  export RIPPLE_TOOLS_GATEWAY_URL="
+              f"{gw_out.get('ToolsGatewayUrl', '?')}")
+        print(f"\n  ingress gateway: {gw_out.get('IngressGatewayUrl', '?')}"
+              f"/{AGENT_NAME}-runtime/invocations")
+        print("  Takes the same {\"prompt\": ...} body as the runtime — it is an HTTP "
+              "front door, not\n  an MCP server (only the TOOLS gateway speaks MCP).")
+        print("\n  NOTE: this is a SECOND front door, not a replacement. The runtime "
+              "stays directly\n  invocable. The control that would stop that "
+              "(AllowedWorkloadConfiguration) cannot be\n  enabled while the ingress "
+              "target uses JWT_PASSTHROUGH — a passthrough target never\n  stamps the "
+              "workload chain, so it would 401 every path. Closeable by moving that\n"
+              "  target to OAUTH outbound; see infra/03-gateways.yaml, IngressGateway "
+              "comment,\n  mitigation (2).")
+
+    if deploy_harness and not args.image_only:
+        h_out = stack_outputs(HARNESS_STACK)
+        print(f"\n  export RIPPLE_HARNESS_ARN={h_out.get('HarnessArn', '?')}")
+        print("\n  The harness is a SEPARATE agent, not a replacement for the runtime "
+              "above. Invoke it\n  with InvokeHarness and an `Authorization: Bearer` "
+              "header — SigV4 deploys and runs\n  but does NOT propagate per-user "
+              "identity, which silently collapses every user's\n  GitHub access to one "
+              "shared credential.")
+        print("  ⚠️  It serves GitHub only. Google Drive stays on the runtime: a "
+              "harness cannot read\n  the caller's token, and a Drive tool that cannot "
+              "learn who is asking cannot narrow a\n  domain-wide service account to "
+              "one user. See infra/04-harness.yaml § M2.")
+        print(f"  It also provisioned its own runtime "
+              f"({h_out.get('ProvisionedRuntimeArn', '?')}) —\n  that is where the extra "
+              "harness_* runtime and log group come from. Do not manage it\n  directly.")
+        print("\n=== ACTION: register the consent return URL for the HARNESS")
+        print("  python3 scripts/register_consent_url.py")
+        print(f"  The harness is a THIRD workload identity (harness_{AGENT_NAME}_"
+              "harness), so users who\n  already consented on the runtime or gateway "
+              "path have NOT consented here. Until it\n  is registered the browser "
+              "shows \"This site can't be reached\" AFTER the user clicks\n  Approve, "
+              "and nothing is logged anywhere in AWS.")
 
     # The callback URL changes whenever the credential provider is REPLACED, and
     # a stale one breaks user auth with no error at deploy time. Always surfaced.

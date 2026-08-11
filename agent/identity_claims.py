@@ -58,7 +58,8 @@ both.
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
 
 This module is the `RT`->`OKTA` edge, step 6a — the one the diagram's own comment calls
-its load-bearing edge, and the only numbered step that belongs to the OBO flow alone.
+its load-bearing edge, and the only numbered step that belongs to the delegation flow
+alone.
 It has no tile: it is a module inside the Runtime container, and the diagram carries
 what it DOES on that edge instead, because the load-bearing fact is not "a module
 exists" but that the subject on the wire to Google was cryptographically verified. The

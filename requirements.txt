@@ -4,7 +4,7 @@
 # This file decides which of the drawn edges the `RT` (AgentCore Runtime) tile can
 # actually walk. It is not itself a component, but omissions here disable flows
 # silently rather than loudly: google-auth + google-api-python-client are what make
-# steps 8a/9a/10a (the OBO flow's service-account assertion, Google's token endpoint,
+# steps 8a/9a/10a (the delegation flow's service-account assertion, Google's token endpoint,
 # and Drive) reachable at all, and pyjwt + cryptography are what make step 6a's
 # signature re-verification possible. An image built without the Google libraries
 # degrades to GitHub-only with a startup warning (agent/agent.py guards the import)
@@ -37,3 +37,13 @@ requests==2.32.3
 # anyway, so an older image degrades to GitHub-only rather than crash-looping.
 google-auth==2.42.1
 google-api-python-client==2.189.0
+# Tools Gateway client (agent/gateway_tool.py). The gateway speaks MCP — there is no
+# "HTTP gateway" — so reaching a `via: GATEWAY` source needs a real MCP client.
+#
+# Present in every image for the same reason as the Google libraries, and guarded the
+# same way: <KEY>_VIA decides the route at RUNTIME, and gateway_tool imports `mcp` lazily
+# inside the call path so an image built before this line still serves the in-process
+# sources instead of crash-looping. Pinned; 1.28.1's LATEST_PROTOCOL_VERSION is
+# 2025-11-25, which is one of the two versions both gateways advertise
+# (infra/03-gateways.yaml), so the client negotiates without a downgrade.
+mcp==1.28.1

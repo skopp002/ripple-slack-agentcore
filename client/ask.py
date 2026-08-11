@@ -23,13 +23,17 @@ than a chat box — no source is named and no permission is requested, which is 
 the two flows indistinguishable at this point), performs 4a/4b, receives 13a/13b, and
 prints 14a/14b.
 
-4a/4b and 13a/13b are drawn against the `Ingress AgentCore Gateway`, which is dashed
-TARGET. Today invoke() POSTs straight at the runtime's own data-plane invocations
-endpoint, so the hop this file really makes is CLI -> AgentCore Runtime, an arrow the
-diagram does not draw at all, and step 5a/5b — the front door validating the JWT and
-forwarding — is performed by the runtime's own CUSTOM_JWT authorizer rather than by
-anything on the diagram's 5a/5b edge. The NOTE block says so in prose; the badges do
-not, so do not read 4a->5a as two hops when tracing against this code.
+4a/4b and 13a/13b are drawn against the `Ingress AgentCore Gateway`. When
+RIPPLE_INGRESS_GATEWAY_URL is set (the default once the gateway stack is deployed),
+invoke() POSTs there and the diagram is literal: CLI -> Ingress Gateway -> Runtime, with
+step 5a/5b — the front door validating the JWT and forwarding — performed by the gateway's
+CUSTOM_JWT authorizer. The gateway is on JWT_PASSTHROUGH, so it forwards the caller's
+Authorization header unchanged and the runtime sees the SAME `sub` it would on a direct
+call (verified live). With `--direct`, or when that URL is unset, invoke() POSTs straight at
+the runtime's own data-plane invocations endpoint instead — the hop is then CLI -> Runtime,
+an arrow the diagram does not draw, and 5a/5b is done by the runtime's own CUSTOM_JWT
+authorizer. Either way there is exactly one front door validating the token; the route only
+changes which component that front door lives in.
 
 The Bearer header set at 4a/4b is the ONLY identity this request carries — the body holds
 the question and nothing else. Step 6a therefore re-verifies the very token the authorizer
@@ -65,21 +69,35 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 from login import login  # noqa: E402
 from consent import complete_consent  # noqa: E402
-from env_util import require_env  # noqa: E402
+from env_util import optional_env, require_env  # noqa: E402
 
 REGION = require_env("AWS_REGION")
 RUNTIME_ARN = require_env("RIPPLE_RUNTIME_ARN")
 QUALIFIER = require_env("RIPPLE_RUNTIME_QUALIFIER")
+# The ingress gateway is the default front door when its URL is known. It is on
+# JWT_PASSTHROUGH, so the request reaches the SAME runtime with the SAME caller identity
+# as a direct call — verified: the runtime echoes the caller's `sub` unchanged either way.
+# Unset it (or pass --direct) to POST straight at the runtime data plane instead.
+INGRESS_GATEWAY_URL = optional_env("RIPPLE_INGRESS_GATEWAY_URL") or ""
+# The gateway routes by TARGET NAME in the path, not "/invocations": the ingress target is
+# named after the runtime stack's runtime. `/{target}/invocations` is the working route;
+# a bare `/invocations` 404s with "No Target found for Target name: invocations".
+INGRESS_TARGET_NAME = optional_env("RIPPLE_INGRESS_TARGET_NAME") or "ripple-runtime"
 
 
-def invoke(prompt: str, access_token: str, session_id: str) -> dict:
-    # Data-plane HTTPS endpoint for CUSTOM_JWT runtimes: the ARN is URL-encoded
-    # into the path and the user JWT is the bearer credential.
-    arn_enc = urllib.parse.quote(RUNTIME_ARN, safe="")
-    url = (
-        f"https://bedrock-agentcore.{REGION}.amazonaws.com"
-        f"/runtimes/{arn_enc}/invocations"
-    )
+def invoke(prompt: str, access_token: str, session_id: str,
+           via_ingress: bool = True) -> dict:
+    # Default: through the ingress gateway if we know its URL. Otherwise (or with
+    # --direct) POST at the runtime's own data-plane endpoint, where the ARN is
+    # URL-encoded into the path. Both authenticate the same user JWT as the bearer.
+    if via_ingress and INGRESS_GATEWAY_URL:
+        url = f"{INGRESS_GATEWAY_URL.rstrip('/')}/{INGRESS_TARGET_NAME}/invocations"
+    else:
+        arn_enc = urllib.parse.quote(RUNTIME_ARN, safe="")
+        url = (
+            f"https://bedrock-agentcore.{REGION}.amazonaws.com"
+            f"/runtimes/{arn_enc}/invocations"
+        )
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -165,7 +183,8 @@ def _render(resp: dict, args, prompt: str, access_token: str,
                 # user typed a question, not a request to authorize.
                 print("\n" + "-" * 60)
                 print("Re-asking now that the new source(s) are connected...\n")
-                return _render(invoke(prompt, access_token, session_id),
+                return _render(invoke(prompt, access_token, session_id,
+                                      via_ingress=not args.direct),
                                args, prompt, access_token, session_id,
                                allow_consent=False)
         # Non-zero only if NOTHING was searched. With several sources, a partial
@@ -222,6 +241,9 @@ def main() -> int:
     ap.add_argument("--no-consent", action="store_true",
                     help="print consent URLs instead of completing them in a "
                          "browser (for headless runs; leaves sources unconnected)")
+    ap.add_argument("--direct", action="store_true",
+                    help="POST straight at the runtime data plane, bypassing the "
+                         "ingress gateway (the default route when its URL is set)")
     args = ap.parse_args()
 
     prompt = " ".join(args.prompt)
@@ -243,8 +265,10 @@ def main() -> int:
     # agent never reads the id.
     session_id = f"ripple-{uuid.uuid4().hex}"
 
-    print(f"\nAsking Ripple: {prompt}\n" + "-" * 60)
-    resp = invoke(prompt, access_token, session_id)
+    via_ingress = not args.direct and bool(INGRESS_GATEWAY_URL)
+    route = "ingress gateway" if via_ingress else "runtime (direct)"
+    print(f"\nAsking Ripple [{route}]: {prompt}\n" + "-" * 60)
+    resp = invoke(prompt, access_token, session_id, via_ingress=not args.direct)
     return _render(resp, args, prompt, access_token, session_id)
 
 

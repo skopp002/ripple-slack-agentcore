@@ -10,9 +10,11 @@ Every resource carries the cost allocation tag
 >
 > | PNG | What it shows | Regenerate |
 > |---|---|---|
-> | [`architecture-components.png`](architecture-components.png) | the components and trust boundaries, in official AWS icons — comparable side by side with the customer's own current-state diagram. Draws **both flows**: green `1a`–`14a` (OBO, no consent) and orange `1b`–`14b` + `★` (consent), with a derived step table per flow | `python3 infra/render_components.py` |
+> | [`architecture-components-v3.png`](architecture-components-v3.png) ★ **read this one** | the current component view: **ONE token client, THREE configurations, FIVE sources**. Adds Confluence, Slack-as-a-source and Databricks Genie to the two built sources, and badges every last hop with the mechanism it uses (`M1` consent / `M2` delegation / `M3` token exchange). AgentCore Identity is drawn as the *only* token client — it implements RFC 8693/7523 natively, so there is no exchange client to build — and the diagram states why Google and Slack can never be `M3`. Same two flows and step tables as below | `python3 infra/render_components_v3.py` |
+> | [`architecture-components-v2.png`](architecture-components-v2.png) | superseded by v3, kept for diff. Same five sources and three mechanisms, but draws Okta as a token-exchange participant and leaves `M3`'s emptiness looking like a schedule rather than a vendor rule | `python3 infra/render_components_v2.py` |
+> | [`architecture-components.png`](architecture-components.png) | v1 — the two built sources only, and it calls the Google Drive path "OBO", which v2 corrected (that name means `M3` in `agent/agent.py`, and Drive is `M2`). That label is now the ONLY surviving use of the word in the repo, left deliberately: v1 is a record of what the diagram used to claim, and rewriting it would destroy the diff v2's and v3's comments refer to. Superseded; kept because `ARCHITECTURE.md` and `CODE-WALKTHROUGH.md` still embed it | `python3 infra/render_components.py` |
 > | [`architecture-deploy-flow.png`](architecture-deploy-flow.png) | deploy-time flow in sequence form, 21 numbered edges. START is the operator shell, END a tagged live runtime — the one flow with no end user in it | `python3 infra/render_diagrams.py` |
-> | [`architecture-obo-flow.png`](architecture-obo-flow.png) | the OBO flow (Google Drive) in sequence form, 17 numbered edges. START and END are both the user, with ONE invocation between them and no consent screen anywhere on the canvas | `python3 infra/render_diagrams.py` |
+> | [`architecture-delegation-flow.png`](architecture-delegation-flow.png) | the delegation flow — `M2`, Google Drive — in sequence form, 17 numbered edges. Renamed from `architecture-obo-flow.png`: the flow it draws is domain-wide delegation, while "OBO" means `M3` in `agent/agent.py`, so the old filename named the one mechanism the diagram does not show. START and END are both the user, with ONE invocation between them and no consent screen anywhere on the canvas | `python3 infra/render_diagrams.py` |
 > | [`architecture-consent-flow.png`](architecture-consent-flow.png) | the consent flow (GitHub) in sequence form, 26 numbered edges. START and END are both the user, but TWO invocations sit between them because a human acts in the middle | `python3 infra/render_diagrams.py` |
 >
 > Run from `solution/`. Both renderers are matplotlib-only — no Node, no Docker,
@@ -20,9 +22,9 @@ Every resource carries the cost allocation tag
 >
 > ⚠️ **There are THREE independent numbering schemes across these four PNGs.** The
 > components diagram suffixes its badges by flow: steps `1a`–`5a` / `1b`–`5b` are shared,
-> and the paths diverge at `6` into `6a`–`14a` (OBO) and `6b`–`14b` + `★` (consent). Each
+> and the paths diverge at `6` into `6a`–`14a` (delegation) and `6b`–`14b` + `★` (consent). Each
 > request-flow PNG numbers its own single flow contiguously and unsuffixed — `1`–`17` on
-> the OBO diagram, `1`–`26` on the consent diagram — so the same integer means different
+> the delegation diagram, `1`–`26` on the consent diagram — so the same integer means different
 > things on the two canvases. The deploy diagram runs `1`–`21` in a fourth, unrelated
 > sequence. None is wrong, but a step number is meaningless without naming the diagram
 > it came from. `render_diagrams.py` and `render_components.py` are the authoritative
@@ -40,13 +42,29 @@ all with `tagOnCreate: true`):
 | Memory | `AWS::BedrockAgentCore::Memory` | `02-runtime.yaml` |
 | GitHub OAuth provider | `AWS::BedrockAgentCore::OAuth2CredentialProvider` | `02-runtime.yaml` |
 | Runtime role | `AWS::IAM::Role` | `02-runtime.yaml` |
+| Ingress + tools Gateways, targets | `AWS::BedrockAgentCore::Gateway`, `GatewayTarget` | `03-gateways.yaml` |
+| Managed harness + its role | `AWS::BedrockAgentCore::Harness`, `AWS::IAM::Role` | `04-harness.yaml` |
 | ECR repo | `AWS::ECR::Repository` | `01-foundation.yaml` |
 | CodeBuild + role | `AWS::CodeBuild::Project`, `AWS::IAM::Role` | `01-foundation.yaml` |
 | Build source bucket | `AWS::S3::Bucket` | `01-foundation.yaml` |
 | CodeBuild log group | `AWS::Logs::LogGroup` | `01-foundation.yaml` |
 
-Also available if ever needed: `Gateway`, `GatewayTarget`, `WorkloadIdentity`,
-`ApiKeyCredentialProvider`, `Browser`, `CodeInterpreter`, `TokenVault`.
+Also available if ever needed: `WorkloadIdentity`, `ApiKeyCredentialProvider`, `Browser`,
+`CodeInterpreter`, `TokenVault`, `HarnessVersion`, `HarnessEndpoint`.
+
+⚠️ **One thing is NOT expressible in CloudFormation: a `TOKEN_EXCHANGE` grant on a harness
+tool.** The API's `OAuthGrantType` accepts `CLIENT_CREDENTIALS`, `AUTHORIZATION_CODE` **and**
+`TOKEN_EXCHANGE`; the CFN schema for the same field (`OAuthCredentialProvider.GrantType`,
+verified with `describe_type`) accepts only the first two. So M3 TOKEN EXCHANGE on the
+harness path needs `create-harness`/`update-harness` over the API until that closes. Adding
+the value to the template fails at change-set time with a schema error.
+
+⚠️ **And a green harness stack does not mean a working agent.** `AWS::BedrockAgentCore::Harness`
+validates its `Model` block against the CFN schema, not against the model: `Temperature: 0.2`
+deployed cleanly and then failed *every* invocation with `` `temperature` is deprecated for
+this model ``. Tool configuration is the same — a gateway tool the harness cannot authenticate
+to fails when the session loads it, inside the event stream, not at deploy. Test with a real
+`InvokeHarness` call.
 
 ### The one imperative step
 
@@ -72,6 +90,15 @@ declares.
 - **Identity secret** — AgentCore Identity creates the Secrets Manager secret
   holding the GitHub client secret when `ClientSecretSource=MANAGED`. Also tagged
   by `apply_tags.py`. Avoid entirely by using `GithubClientSecretArn` (see below).
+- **The harness's own runtime, and its workload identity** — a harness provisions a runtime
+  underneath itself, named `harness_<harnessName>` (note the doubled word: the prefix is
+  literal). `ripple_harness` produced runtime `harness_ripple_harness-ejdAHhBoDB` plus a
+  workload identity of the same name. Both are read-only children of the harness — exposed
+  as `Harness.Environment.AgentCoreRuntimeEnvironment.AgentRuntimeArn` — and are where the
+  otherwise-unexplained `harness_*` runtime and log group in an account come from. Change
+  them only via `UpdateHarness`; deleting the runtime by hand leaves the harness pointing at
+  nothing. The random suffix means the workload identity name **cannot be derived**, which is
+  why `scripts/register_consent_url.py` discovers it by prefix rather than constructing it.
 
 ## Pre-deploy name collisions
 
@@ -160,6 +187,24 @@ GitHub client secret setup first (§ "The GitHub client secret") and export
 
 Afterwards it prints the three `export` lines for `dev.env` and the GitHub
 callback URL to check.
+
+Stacks 3 and 4 are **opt-in and additive**, in that order:
+
+```bash
+export DEPLOY_GATEWAYS=true              # 03-gateways.yaml — ingress + tools Gateways
+export DEPLOY_HARNESS=true               # 04-harness.yaml  — the managed agent
+python3 scripts/deploy.py
+python3 scripts/register_consent_url.py  # now covers THREE workload identities
+```
+
+`DEPLOY_HARNESS` without `DEPLOY_GATEWAYS` is a hard error in `deploy.py`, not a warning: the
+harness's only tool is the tools Gateway, so it would deploy an agent with nothing to call.
+And **stack 4 does not replace stack 2** — a harness overrides the container's `ENTRYPOINT`,
+so `agent/agent.py` never runs there and Google Drive cannot be served on it. Keep the runtime
+stack. `--image-only` is a no-op for stack 4 for the same reason. Full detail in README step 12
+and `CODE-WALKTHROUGH.md` § *The managed Harness route*. Why the harness is experimental rather
+than primary — including a measured caller-override defect — is in
+[`../docs/HARNESS-ASSESSMENT.md`](../docs/HARNESS-ASSESSMENT.md).
 
 ### The same thing by hand
 
@@ -338,6 +383,7 @@ Not a typo in the templates — the schemas genuinely disagree:
 |---|---|
 | `Runtime`, `RuntimeEndpoint`, `Memory` | **map** — `{project_name: value}` |
 | `OAuth2CredentialProvider` | **list** — `[{Key: …, Value: …}]` |
+| `Harness` | **list** — `[{Key: …, Value: …}]`, unlike `Runtime` right beside it |
 | `IAM::Role`, `ECR`, `S3`, `CodeBuild`, `Logs` | **list** — `[{Key: …, Value: …}]` |
 
 `ProtocolConfiguration` likewise differs from boto3: a bare string (`HTTP`) in

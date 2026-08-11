@@ -40,7 +40,8 @@ second scope added to the delegation grant.
 
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAM (infra/architecture-components.png):
 
-This module is the entire right-hand end of the OBO flow — steps 8a, 9a and 10a, which
+This module is the entire right-hand end of the DELEGATION flow (M2) — steps 8a, 9a and
+10a, which
 exist in flow A alone. It has no tile of its own (it is a module inside the `RT`
 container), so its work is drawn as the two arrows leaving the tools gateway. 8a is
 `_credentials()`: `with_subject()` puts the verified email in the assertion's `sub`, and

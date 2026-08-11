@@ -29,7 +29,7 @@ this turn", never "impersonate the default".
     python3 tests/test_caller_identity.py
 
 WHERE THIS SITS IN THE ARCHITECTURE DIAGRAMS. This guards the tail of edge 7 and the
-head of edge 8 on infra/architecture-obo-flow.png: the SDK exposing the authenticated
+head of edge 8 on infra/architecture-delegation-flow.png: the SDK exposing the authenticated
 header on `context`, and the agent reading the JWT from it. The diagram draws edge 8 as
 one arrow to the IdP, which is the verification; the read that supplies its input is
 inside the runtime and has no arrow. tests/test_identity_claims.py covers the
