@@ -722,10 +722,11 @@ It deliberately does not echo the token: that value is a bearer credential, so a
 holding it can act as you until it expires — keep it out of scrollback, tickets and
 screenshots. Use `--print-token` if you need it on stdout anyway.
 
-**Status: deployed and invoked. The managed loop works; the Gateway tool does not yet.**
-Verified on `ripple_harness-5tCOqF76a2`: it reaches the model, honours the system prompt
-verbatim (`Sources:` block, `Confidence: LOW`, and a refusal to guess at a roadmap it could
-not retrieve), and writes to Memory. But loading its one tool fails:
+**Status: the managed loop is verified, and the stack-managed Gateway tool now loads —
+measured.** On the earlier hand-built harness `ripple_harness-5tCOqF76a2` the loop was
+proven live — it reaches the model, honours the system prompt verbatim (`Sources:` block,
+`Confidence: LOW`, and a refusal to guess at a roadmap it could not retrieve), and writes to
+Memory — but loading its one tool failed:
 
 ```
 runtimeClientError ... Failed to load tool 'ripple-tools' (type=agentcore_gateway):
@@ -735,12 +736,26 @@ https://ripple-tools-xaeszuty3h.gateway.bedrock-agentcore.us-west-2.amazonaws.co
 
 The tools Gateway is on `CUSTOM_JWT` inbound, so it accepts only a bearer JWT from its
 configured issuer — **both** `AWS_IAM` (SigV4) and `NONE` are refused, tested. `OAUTH` is
-the matching value and is wired in the template, but it needs a credential provider for the
-*Gateway's* issuer (an Auth0 `client_credentials` client), and this project has only a
-public CLI client with no secret. Creating one is an Auth0-side action, so `AWS_IAM` remains
-the default as the least-surprising no-credential value — read it as *not yet wired*, not
-*verified*. Until then the harness answers every question at LOW confidence with no sources,
-and **does not surface the auth failure to the user**.
+the matching value, and the template now hard-wires it: `04-harness.yaml` declares an Auth0
+`client_credentials` credential provider *as a stack resource* and references it from the
+tool's `OutboundAuth.Oauth`, so there is no longer a public-CLI-client dead end and no
+hand-run script. Two details that make the difference between an accepted token and a
+`401` identical to the `AWS_IAM` one: the grant is `CLIENT_CREDENTIALS`, and the token
+request carries `audience` (as `CustomParameters`) — without it Auth0 returns an *opaque*
+token the Gateway's JWT authorizer rejects. A third, learned on first invoke: under
+`ClientSecretSource=EXTERNAL` AgentCore Identity reads the M2M secret **as the harness
+execution role**, so that role needs `secretsmanager:GetSecretValue` on the secret ARN —
+without it the tool load fails with an `AccessDeniedException` on `GetResourceOauth2Token`,
+not a `401`. With all three in place the stack was **deployed and invoked**: `InvokeHarness`
+returned `200`, `ripple-tools` loaded, and the model called Gateway tools
+(`github___github_get_user`, `github___github_list_orgs`) before returning the expected
+per-user GitHub consent elicitation (M1) for the harness's own — third — workload identity.
+
+⚠️ **This wires the harness to the Gateway as a *machine*, not as the asking user.**
+`client_credentials` authenticates the harness itself; it does not carry per-user identity
+downstream, because a harness still has no `RequestHeaderConfiguration`. So this makes the
+tool *load* — it does not make the harness safe behind an untrusted, per-user front door,
+and it is not the Drive fix (see § M2). The runtime route stays primary for that reason.
 
 ⚠️ **A green stack proves nothing about whether the agent can answer.** Two of the three
 defects above were invisible at deploy time and only appeared inside the event stream on the
@@ -759,14 +774,14 @@ in a way it isn't on the runtime. Note that boto3 needs the SigV4 signer *disabl
 the header alone leaves SigV4 in place and the call is rejected.
 
 ⚠️ **A third consent.** The harness is its own workload identity — the real one here is
-`harness_ripple_harness-ejdAHhBoDB` — so a user who already connected GitHub on the runtime
+`harness_ripple_harness-X2kkImB9ZZ` — so a user who already connected GitHub on the runtime
 *or* the Gateway route has **not** consented here, the same rule as step 11 applying a third
 time. Note the doubled word: the `harness_` prefix is literal and the harness name follows,
 and the service appends a random suffix, so the name **cannot be derived** and
 `register_consent_url.py` discovers it by prefix instead. Skip that step and the redirect
 after Approve lands on nothing, with no error anywhere in AWS.
 
-It also provisioned its own runtime, `harness_ripple_harness-ejdAHhBoDB` — same name as the
+It also provisioned its own runtime, `harness_ripple_harness-X2kkImB9ZZ` — same name as the
 workload identity. That is the answer to "where did this extra `harness_*` runtime and log
 group come from"; don't manage it directly.
 
@@ -795,6 +810,53 @@ Also: `M3 TOKEN EXCHANGE` **cannot be expressed in CloudFormation** on a harness
 accepts a `TOKEN_EXCHANGE` grant type; the CFN schema for the same field accepts only
 `CLIENT_CREDENTIALS` and `AUTHORIZATION_CODE`. It needs `create-harness`/`update-harness`
 over the API until that closes.
+
+### Functionality supported as of now with the AgentCore Harness
+
+This is what the stack-managed harness does today, **measured** end to end from the
+*AgentCore → Harness → Harness playground* console (paste the JWT from
+`python client/login.py --copy`, pick endpoint `DEFAULT`, start a session).
+
+**✅ Tool loading via M2M — works.** The harness authenticates to the tools Gateway as a
+**machine** using the Auth0 `client_credentials` provider declared in `04-harness.yaml`
+(with `customParameters.audience`, or Auth0 returns an opaque token the Gateway rejects).
+`InvokeHarness` returns `200`, `ripple-tools` loads, and the Opus model actually calls the
+Gateway tools — `github___github_get_user` and `github___github_list_orgs` appear in the
+agent trace as real tool calls, not hallucinations.
+
+**✅ Per-user consent elicitation (M1) fires — as designed.** Because the harness reaches
+the GitHub source as a *machine*, it still has no per-user GitHub token, so the very first
+GitHub tool call comes back as an **MCP elicitation** asking the user to complete GitHub
+OAuth. The harness is its own — **third** — workload identity, so this consent is separate
+from any the user already completed on the runtime. Both the summarised turn and the raw
+tool output carry the authorization URL and an `elicitationId`:
+
+![Harness turn: both GitHub tool calls return an MCP elicitation with a login URL, and the model explains authentication is still blocking and offers the consent links](screenshots/M1-Consent-FlowInEffect.png)
+
+![Raw tool output for `Github Github Get User` — `MCP Elicitation required` with `mode: url`, the `identities/oauth2/authorize` URL, and an `elicitationId`](screenshots/ElicitationtoReceiveAuthorization.png)
+
+So the harness proves the **transport** half of identity (can the caller reach the Gateway)
+and correctly surfaces the **per-user** half (as whom is data served) as a consent prompt.
+
+**What it does NOT support today** — the reasons `02-runtime.yaml` stays the primary agent:
+
+- **No Google Drive (M2 delegation).** A harness has no `RequestHeaderConfiguration`, so the
+  tool path cannot learn who is asking and cannot narrow the domain-wide Google key to one
+  user. The template ships **no** Drive tool rather than a domain-wide one.
+- **No per-user JWT propagation.** M2M authenticates the harness itself; it does not forward
+  the caller's identity downstream. The runtime does this in one hop by forwarding the JWT;
+  the harness needs the M2M door **plus** per-user consent.
+- **Guardrails are per-request defaults, not a ceiling.** `InvokeHarness` accepts
+  `systemPrompt`, `tools` and `allowedTools` as call parameters that *replace* the configured
+  values, so the template's grounding prompt and allowlist cannot be relied on behind an
+  untrusted front door. This is the headline finding of
+  [`docs/HARNESS-ASSESSMENT.md`](docs/HARNESS-ASSESSMENT.md).
+- **M3 token exchange isn't expressible in CloudFormation** (see just above).
+
+Bottom line: the harness is a working experiment that loads tools and drives M1 consent, but
+until it can read caller identity and enforce non-overridable guardrails it is not a
+per-user, security-sensitive primary agent. Full measured detail:
+[`docs/HARNESS-ASSESSMENT.md`](docs/HARNESS-ASSESSMENT.md).
 
 ### 13. Activate the cost allocation tag (once per account)
 

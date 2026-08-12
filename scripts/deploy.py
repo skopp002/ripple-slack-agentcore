@@ -26,7 +26,10 @@ Everything is now CloudFormation:
                          runtime is directly invocable without it and the default
                          route for every source is still in-process, so a gateway
                          that nothing uses is cost and surface with no benefit.
-    04-harness.yaml      MANAGED AgentCore Harness (AWS runs the agent loop)
+    04-harness.yaml      MANAGED AgentCore Harness (AWS runs the agent loop),
+                         fully stack-managed: it also declares the Auth0 M2M
+                         credential provider the harness uses for outbound gateway
+                         auth, so nothing is created or patched outside the stack.
                          <- OPT-IN, via DEPLOY_HARNESS=true, and it needs
                          DEPLOY_GATEWAYS too because its only tool is the tools
                          gateway.
@@ -270,8 +273,11 @@ def preflight(dry: bool) -> None:
          any(g.get("name") == f"{AGENT_NAME}-tools"
              for g in acp.list_gateways().get("items", []))),
         # 04-harness.yaml. Underscore, not hyphen: a harness name matches
-        # ^[a-zA-Z][a-zA-Z0-9_]{0,39}$ and rejects the `-` every other resource here
-        # uses, so this name cannot be built by the same f-string pattern as the rest.
+        # ^[a-zA-Z][a-zA-Z0-9_]{0,39}$ and rejects the `-` every other resource here uses.
+        # ⚠️ THIS IS THE ONE THAT USUALLY FIRES: a hand-made `<agent>_harness` created
+        # outside any stack (via the toolkit) cannot be ADOPTED by CloudFormation — this
+        # stack would try to CREATE a same-named harness and roll back. Delete the
+        # unmanaged harness first, then deploy; the stack owns the canonical name.
         ("04-harness", f"iam role Ripple{AGENT_NAME}HarnessRole",
          _exists(iam.get_role, RoleName=f"Ripple{AGENT_NAME}HarnessRole")),
         # ⚠️ Also catches the runtime a PREVIOUS harness provisioned for itself. A
@@ -282,6 +288,11 @@ def preflight(dry: bool) -> None:
         ("04-harness", f"harness named {AGENT_NAME}_harness",
          any(h.get("harnessName") == f"{AGENT_NAME}_harness"
              for h in acp.list_harnesses().get("harnesses", []))),
+        # The stack-managed Auth0 M2M provider the harness uses for outbound gateway auth.
+        ("04-harness", f"oauth2 credential provider {AGENT_NAME}-gw-auth0",
+         any(p.get("name") == f"{AGENT_NAME}-gw-auth0"
+             for p in acp.list_oauth2_credential_providers()
+             .get("credentialProviders", []))),
     ]
 
     conflicts = []
@@ -400,6 +411,17 @@ def main() -> int:
     # the environment — the deployed gateway is the authoritative answer.
     tools_gateway_url = optional_env("RIPPLE_TOOLS_GATEWAY_URL") or ""
     github_via = optional_env("GITHUB_VIA") or ""
+    # How the HARNESS authenticates ITSELF to the tools gateway (04-harness.yaml). The
+    # gateway is CUSTOM_JWT inbound, so AWS_IAM and NONE both 401 at tool load; OAUTH is the
+    # only value that loads the tool, and the template hard-wires it. The Auth0 M2M provider
+    # is a STACK RESOURCE, so deploy passes only the client id and the Secrets Manager ARN of
+    # its secret — never the secret itself, and never a hand-created provider ARN. The
+    # provider ARN is resolved inside the template via !GetAtt, which also orders the
+    # dependency for CloudFormation.
+    m2m_client_id = optional_env("AUTH0_M2M_CLIENT_ID") or ""
+    m2m_secret_arn = optional_env("AUTH0_M2M_CLIENT_SECRET_ARN") or ""
+    m2m_secret_json_key = optional_env("AUTH0_M2M_CLIENT_SECRET_JSON_KEY") or ""
+    gateway_oauth_scopes = optional_env("GATEWAY_OAUTH_SCOPES") or ""
     if github_via.upper() == "GATEWAY" and not (deploy_gateways or tools_gateway_url):
         print("\nERROR: GITHUB_VIA=GATEWAY but no tools gateway is available.\n"
               "  Either set DEPLOY_GATEWAYS=true to create one, or set "
@@ -415,6 +437,25 @@ def main() -> int:
               "then answer every question with no sources at\n  all, which reads as a "
               "model problem rather than a missing stack.\n"
               "  Set DEPLOY_GATEWAYS=true.", file=sys.stderr)
+        return 2
+    if deploy_harness and not m2m_client_id:
+        print("\nERROR: DEPLOY_HARNESS=true but AUTH0_M2M_CLIENT_ID is not set.\n"
+              "  The harness reaches the CUSTOM_JWT tools gateway with an Auth0 "
+              "client_credentials\n  token; AWS_IAM and NONE both 401 at tool load, so "
+              "OAUTH is not optional.\n  The stack declares the Auth0 credential provider "
+              "as a resource, but it still needs the\n  M2M app's client id (and its "
+              "secret in Secrets Manager — AUTH0_M2M_CLIENT_SECRET_ARN).\n"
+              "  Set AUTH0_M2M_CLIENT_ID in dev.env.", file=sys.stderr)
+        return 2
+    if deploy_harness and not m2m_secret_arn:
+        # Not fatal — the template's MANAGED fallback exists — but passing the secret as
+        # a CloudFormation parameter stores it in the stack, so we refuse to do it
+        # silently. Point at the ARN route and stop.
+        print("\nERROR: DEPLOY_HARNESS=true but AUTH0_M2M_CLIENT_SECRET_ARN is not set.\n"
+              "  Store the M2M client secret in Secrets Manager and pass its ARN, exactly "
+              "like\n  GITHUB_CLIENT_SECRET_ARN. deploy does NOT accept the raw secret as a "
+              "parameter\n  (it would be stored in the CloudFormation stack).\n"
+              "  See infra/README.md § 'The harness M2M client secret'.", file=sys.stderr)
         return 2
     if google_sa_arn and not allowed_domains:
         print("\nERROR: GOOGLE_SA_SECRET_ARN is set (Drive enabled) but "
@@ -549,21 +590,34 @@ def main() -> int:
     # --image-only: the harness does not run our image at all, so a new image tag is
     # not a reason to touch it. That is the clearest single symptom of what a Harness
     # is — `--image-only` is a no-op for it.
+    #
+    # FULLY STACK-MANAGED: it declares the Auth0 M2M credential provider and the harness
+    # together, so there is nothing to create or patch by hand. OAUTH outbound is not
+    # optional here (it is the only value that loads the tool), so the M2M client id is
+    # required whenever the harness is deployed.
     if deploy_harness and not args.image_only:
         harness_params = {
             "GatewayStackName": GATEWAY_STACK,
-            "RuntimeStackName": RUNTIME_STACK,
             "AgentName": AGENT_NAME,
             "ProjectTagValue": tags.TAG_VALUE,
             "BedrockModelId": model_id,
             "Auth0Domain": auth0_domain,
             "Auth0Audience": auth0_audience,
-            "GithubScopes": github_scopes,
-            # Same value 02 and 03 get. The harness is a THIRD workload identity, so it
-            # drives its own consent, but the return URL must still be the one URL our
-            # client actually serves.
-            "ConsentReturnUrl": CONSENT_RETURN_URL,
+            # The Auth0 M2M app authorized for Auth0Audience. Not the public CLI client.
+            "Auth0M2mClientId": m2m_client_id,
+            # Scopes stay EMPTY by default — client_credentials is scoped by audience,
+            # and GitHub's scopes are the wrong vocabulary for Auth0. Passed as a stored
+            # value so an override actually takes effect.
+            "GatewayOauthScopes": gateway_oauth_scopes,
         }
+        # PREFERRED path: the secret lives in Secrets Manager and the template reads it
+        # (ClientSecretSource=EXTERNAL). Only the ARN is passed — never the secret, and
+        # never as a CloudFormation parameter value. Without it the template falls back to
+        # MANAGED, which needs the secret passed some other way; we do not do that here.
+        if m2m_secret_arn:
+            harness_params["Auth0M2mClientSecretArn"] = m2m_secret_arn
+            if m2m_secret_json_key:
+                harness_params["Auth0M2mClientSecretJsonKey"] = m2m_secret_json_key
         # Closes FR-18. The runtime provisions Memory and never reads it; the harness
         # takes an ARN and AWS does the reading and writing. Passed only when the
         # runtime stack actually produced one — an empty MemoryArn makes the template

@@ -1,19 +1,33 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Ripple Slack Assistant — the MANAGED AgentCore Harness. This template is that agent: model, system prompt, tools, memory and
-  limits as CONFIGURATION, with AWS running the loop. Deploy AFTER 03-gateways.yaml —
-  the harness's only tool is the tools gateway.
+  Ripple Slack Assistant — the MANAGED AgentCore Harness, FULLY STACK-MANAGED. This
+  template owns everything the harness needs — the Auth0 credential provider it uses to
+  reach the tools gateway, its IAM role, and the harness itself — so nothing has to be
+  created or patched outside CloudFormation. Deploy AFTER 03-gateways.yaml (imports the
+  tools gateway ARN).
 
-# ⚠️⚠️ DO NOT USE FOR DEPLOYMENT YET — USE THE RUNTIME ROUTE (02-runtime.yaml) INSTEAD.
+# STACK-MANAGED, OAUTH-ONLY, NOTHING BY HAND
+#   The tools gateway is CUSTOM_JWT inbound, so AWS_IAM/NONE outbound both 401 at tool
+#   load. The only value that loads the tool is OAUTH, and this template hard-wires it:
+#     • the Auth0 credential provider is a stack resource (GatewayAuth0Provider);
+#     • the harness references it via !GetAtt, so CFN orders the dependency;
+#     • there is no AWS_IAM/NONE toggle to pick by mistake.
+#   Everything the harness relies on is therefore a CloudFormation resource — there is no
+#   companion script that creates a provider or patches a live harness out of band.
 #
-# This stack is EXPERIMENTAL and must not be the deployed agent for now. On the harness the
-# system prompt and tool allowlist are per-request DEFAULTS rather than server-enforced
-# limits, so they cannot be relied on behind an untrusted front door — and the harness cannot
-# serve Google Drive (M2) at all. The runtime route bakes the prompt and tools into the image
-# where the caller cannot reach them, and is the only path that serves Drive safely. Full
-# assessment: ../docs/HARNESS-ASSESSMENT.md.
-# Keep this template for the experiment (DEPLOY_HARNESS=true), but deploy via the runtime.
-
+#   ⚠️ CFN CANNOT ADOPT AN EXISTING HAND-MADE HARNESS. A harness created outside a stack
+#   (e.g. via the toolkit) with the same name makes this stack's CREATE roll back on
+#   "already exists". deploy.py's preflight detects that and stops with the name; delete
+#   the unmanaged harness (and the runtime it provisioned for itself) before deploying.
+#
+# WHAT THIS STILL DOES NOT FIX (see ../docs/HARNESS-ASSESSMENT.md)
+#   OAUTH outbound authenticates the HARNESS to the gateway as a MACHINE (client_credentials).
+#   It does NOT carry the asking user's identity downstream: a harness has no
+#   RequestHeaderConfiguration, so gateway calls still run as one shared identity, not per
+#   user. This makes the harness usable for tool loading; it does NOT make it safe behind an
+#   untrusted, per-user front door. The runtime (02-runtime.yaml) remains the primary agent.
+#   The per-request-guardrail finding (§2 of the assessment) is also unchanged.
+#
 # ⚠️ A HARNESS DOES NOT RUN agent/agent.py.
 #
 # Two different things share the name. `bedrock_agentcore.runtime.BedrockAgentCoreApp` is
@@ -25,23 +39,21 @@ Description: >
 # things: remote_mcp, agentcore_gateway, agentcore_browser, agentcore_code_interpreter, or
 # inline_function (which runs in the CALLER). A harness also provisions its own runtime
 # underneath, named `harness_<harnessName>` — that is where the stray harness-shaped
-# runtime and log group in the account come from.
-#
-# So this is a second, parallel implementation, not 02 with a different resource type.
+# runtime and log group in the account come from. So this is a second, parallel
+# implementation, not 02 with a different resource type.
 #
 # HOW THE THREE MECHANISMS LAND (named with no shared vocabulary so they cannot blur):
 #
 #   M1 CONSENT (GitHub) — MIGRATES, and becomes someone else's code. gateway_tool.py's
-#     -32042 handling and ExceptionGroup unwrapping collapse into OutboundAuth.Oauth
-#     below; the harness drives the elicitation. The SECOND CONSENT does not go away —
-#     the harness is a THIRD workload identity, so a user consented on the runtime or
+#     -32042 handling and ExceptionGroup unwrapping collapse into the tools gateway's own
+#     OAUTH target; the harness drives the elicitation. The SECOND CONSENT does not go away
+#     — the harness is a THIRD workload identity, so a user consented on the runtime or
 #     gateway route has not consented here.
 #
 #   M3 TOKEN EXCHANGE — ⚠️ NOT EXPRESSIBLE IN CLOUDFORMATION. botocore's OAuthGrantType
 #     accepts TOKEN_EXCHANGE; the CFN enum for the same field accepts only
-#     CLIENT_CREDENTIALS and AUTHORIZATION_CODE (verified via describe_type). Needs the
-#     create-harness/update-harness API until that closes. And the rule still holds:
-#     AgentCore Identity performs the exchange, never us.
+#     CLIENT_CREDENTIALS and AUTHORIZATION_CODE (verified via describe_type). And the rule
+#     still holds: AgentCore Identity performs the exchange, never us.
 #
 #   M2 DELEGATION (Google Drive) — ⚠️ CANNOT BE SERVED HERE. Two structural blockers:
 #     (1) OutboundAuth is a union of {AwsIam | None | Oauth}, and Drive's mechanism is a
@@ -52,44 +64,25 @@ Description: >
 #         context carries only gateway/target/tool ids, no caller.
 #     ⚠️ That is a SECURITY STOP, not a missing feature. The service-account key holds
 #     domain-wide delegation; the only thing narrowing it to one person is the subject we
-#     pass, which must come from a signature-verified claim (see agent/gdrive_tool.py).
-#     A tool that cannot learn who is asking cannot narrow anything — it would turn a
-#     per-user read into a domain-wide one while every log line still looked correct. So
-#     this ships NO Drive tool rather than a degraded one. The two survivable designs,
-#     both of which move a trust boundary and so are not chosen here: an inline_function
-#     (correct on identity, but relocates the key out of AWS into the caller), or a
-#     gateway REQUEST INTERCEPTOR with passRequestHeaders (keeps the key in AWS; costs a
-#     Lambda and a new place identity is decided).
+#     pass, which must come from a signature-verified claim (see agent/gdrive_tool.py). So
+#     this ships NO Drive tool rather than a degraded one.
 #
 # THEREFORE 02-runtime.yaml MUST STAY. This stack is additive; deleting the runtime to
-# "finish" the migration would silently drop the Drive source. Also lost on this path,
-# and listed in README § 12: identity_claims' five checks, the per-source fan-out, the
-# POLICY-failure refusal, and _scope's hard error on an unscoped GitHub search — on this
-# path only the system prompt prevents searching all of public GitHub.
-#
-# DIAGRAM (infra/architecture-components.png): a NEW tile beside `RT`, not a replacement,
-# consuming the same `TGW` and `MEM` tiles. Its arrow to `MEM` is the first real one.
+# "finish" the migration would silently drop the Drive source.
 
 Parameters:
   GatewayStackName:
     Type: String
     Description: Stack name of 03-gateways.yaml. The tools gateway ARN is imported from it.
-  RuntimeStackName:
-    Type: String
-    Description: >
-      Stack name of 02-runtime.yaml. Imported for the GitHub credential provider ARN only,
-      so consent vaulted for the gateway target and consent requested here resolve to the
-      SAME provider — a second provider would issue a new callback URL and invalidate
-      every existing user's consent.
   AgentName:
     Type: String
     Default: ripple
     AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,31}$'
     Description: >
-      Capped at 32, not the runtime's 48: HarnessName is `<AgentName>_harness` against
-      ^[a-zA-Z][a-zA-Z0-9_]{0,39}$. NOTE NO HYPHENS — harness names reject the `-` that
-      gateway and runtime names allow. HarnessName is createOnly, so changing this
-      replaces the harness AND the runtime it owns, and orphans every vaulted token.
+      HarnessName is `<AgentName>_harness` against ^[a-zA-Z][a-zA-Z0-9_]{0,39}$, so
+      AgentName is capped shorter to leave room for the suffix. NO HYPHENS — harness names
+      reject the `-` gateway/runtime names allow. createOnly: changing it replaces the
+      harness and orphans vaulted tokens.
   ProjectTagValue:
     Type: String
     Default: ripple-slack-assistant
@@ -99,59 +92,52 @@ Parameters:
   Auth0Domain:
     Type: String
     Description: >
-      Derived into the authorizer below with Auth0Audience, so the harness's front door
-      cannot drift from the runtime's — one definition of an acceptable token.
+      The Auth0 tenant domain (e.g. dev-xxxx.us.auth0.com). Drives BOTH the harness's
+      inbound authorizer AND the outbound provider's issuer/endpoints, so the front door
+      and the machine token come from one tenant definition.
   Auth0Audience:
     Type: String
-  ConsentReturnUrl:
-    Type: String
-    Default: 'http://localhost:8799/consent'
     Description: >
-      MUST match client/consent.py byte for byte, and must be registered on the HARNESS's
-      workload identity (scripts/register_consent_url.py). A mismatch or missing
-      registration fails at the LAST hop, after the user has clicked Approve.
-  GithubScopes:
-    Type: CommaDelimitedList
-    Default: 'repo,read:org'
-    Description: >
-      Kept identical to the gateway target's scopes; a superset would re-prompt users who
-      have already consented.
-  ToolsGatewayOutboundAuth:
-    Type: String
-    Default: AWS_IAM
-    AllowedValues: [AWS_IAM, OAUTH, NONE]
-    Description: >
-      How the HARNESS authenticates ITSELF to the tools gateway — not how the user's
-      identity reaches GitHub, which rides the workload identity chain automatically.
+      The API identifier the tools gateway's authorizer accepts. Used in TWO places that
+      must agree: the harness authorizer's AllowedAudience, and — critically — the outbound
+      token request's `audience` (CustomParameters below). Auth0 mints a JWT only when the
+      token request carries this; without it the token is opaque and the gateway 401s.
 
-      ⚠️ MEASURED: NEITHER AWS_IAM NOR NONE WORKS TODAY, and OAUTH cannot be configured
-      yet. Both non-OAuth values deploy green and then fail identically on the FIRST
-      invoke, inside the event stream:
-        runtimeClientError ... Failed to load tool 'ripple-tools'
-        (type=HarnessToolType.agentcore_gateway): Failed to start MCP client ...
-        Client error '401 Unauthorized' for url https://ripple-tools-....../mcp
-      The tools gateway is on CUSTOM_JWT inbound, so it accepts only a bearer JWT from
-      its configured issuer — a SigV4 call and an unauthenticated call are both refused.
-      OAUTH is the matching value and is wired below, but it needs a credential provider
-      for the GATEWAY's issuer (an Auth0 CLIENT_CREDENTIALS client), and this project has
-      only a public CLI client with no secret. Creating one is an Auth0-side action.
-      Until then the harness answers, honours the prompt and reports LOW confidence with
-      no sources, because tool loading failed — it does not report an auth error to the
-      user. AWS_IAM is kept as the default only because it is the least surprising
-      no-credential value; read it as "not yet wired", not "verified".
-  GatewayOauthProviderArn:
+  # ---- Auth0 Machine-to-Machine client (harness -> tools gateway outbound) ----
+  Auth0M2mClientId:
+    Type: String
+    Description: >
+      Client ID of the Auth0 Machine-to-Machine app authorized for the Auth0Audience API.
+      This is NOT the public CLI client (which cannot do client_credentials).
+  Auth0M2mClientSecretArn:
     Type: String
     Default: ''
     Description: >
-      Required only when ToolsGatewayOutboundAuth=OAUTH. The provider whose token the
-      GATEWAY accepts — an Auth0 provider, NOT the GitHub one.
-  GatewayOauthGrantType:
+      PREFERRED. Secrets Manager ARN holding the M2M client secret. The secret value never
+      enters this template or CloudFormation parameters — only the ARN, which is not
+      sensitive. Leave empty only if using the MANAGED fallback below.
+  Auth0M2mClientSecretJsonKey:
     Type: String
-    Default: CLIENT_CREDENTIALS
-    AllowedValues: [CLIENT_CREDENTIALS, AUTHORIZATION_CODE]
+    Default: ''
     Description: >
-      The exchange grant is deliberately absent — see M3 in the header. Adding it fails
-      at change-set time with a schema error.
+      If the Secrets Manager secret is a JSON object, the key holding the secret string.
+      Empty means the secret is stored as a plain string.
+  Auth0M2mClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      MANAGED fallback, used ONLY when Auth0M2mClientSecretArn is empty. Passing the secret
+      as a parameter stores it in CloudFormation; prefer the Secrets Manager ARN above.
+
+  GatewayOauthScopes:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      OAuth scopes for the harness->gateway token. EMPTY is correct: Auth0's
+      client_credentials grant is scoped by `audience`, not scope, and GitHub's scopes
+      (`repo`/`read:org`) are GitHub's vocabulary — meaningless to Auth0. Set one only if
+      the gateway's issuer specifically requires it.
   MemoryArn:
     Type: String
     Default: ''
@@ -159,9 +145,6 @@ Parameters:
   MaxIterations:
     Type: Number
     Default: 12
-    Description: >
-      Hard stop on loop turns. A cost and blast-radius control the runtime does not have
-      at all — agent.py's Strands loop is unbounded.
   TimeoutSeconds:
     Type: Number
     Default: 300
@@ -170,12 +153,47 @@ Parameters:
     Default: 8192
 
 Conditions:
-  UseOauthOutbound: !Equals [!Ref ToolsGatewayOutboundAuth, 'OAUTH']
-  UseAwsIamOutbound: !Equals [!Ref ToolsGatewayOutboundAuth, 'AWS_IAM']
+  UseExternalSecret: !Not [!Equals [!Ref Auth0M2mClientSecretArn, '']]
+  UseSecretJsonKey: !Not [!Equals [!Ref Auth0M2mClientSecretJsonKey, '']]
   UseMemory: !Not [!Equals [!Ref MemoryArn, '']]
+  # An empty CommaDelimitedList resolves to [''] — a one-element list holding an empty
+  # string, which fails the Scopes item minLength:1. Select[0] of that is '', so this is
+  # false when no scopes are set and the OutboundAuth block emits a genuine empty [].
+  HasGatewayScopes: !Not [!Equals [!Select [0, !Ref GatewayOauthScopes], '']]
 
 Resources:
-  # Not the runtime's role — a harness needs a different statement set.
+  # The Auth0 machine credential the harness presents to the tools gateway. Stack-managed,
+  # so it is created and destroyed with the harness — no companion script, nothing to patch
+  # by hand. Vendor Auth0Oauth2 + IncludedOauth2ProviderConfig: a first-party tenant with
+  # discrete issuer/token endpoints, exactly like the GitHub provider in 02-runtime.yaml but
+  # for our own Auth0 tenant rather than github.com.
+  GatewayAuth0Provider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Sub '${AgentName}-gw-auth0'
+      CredentialProviderVendor: Auth0Oauth2
+      Oauth2ProviderConfigInput:
+        IncludedOauth2ProviderConfig:
+          ClientId: !Ref Auth0M2mClientId
+          # Required by the API even for client_credentials (no browser redirect ever
+          # happens); the provider shape is validated whole.
+          Issuer: !Sub 'https://${Auth0Domain}/'
+          AuthorizationEndpoint: !Sub 'https://${Auth0Domain}/authorize'
+          TokenEndpoint: !Sub 'https://${Auth0Domain}/oauth/token'
+          # Exactly one of these two paths applies — see UseExternalSecret.
+          ClientSecretSource: !If [UseExternalSecret, EXTERNAL, MANAGED]
+          ClientSecretConfig: !If
+            - UseExternalSecret
+            - SecretId: !Ref Auth0M2mClientSecretArn
+              JsonKey: !If [UseSecretJsonKey, !Ref Auth0M2mClientSecretJsonKey, !Ref 'AWS::NoValue']
+            - !Ref 'AWS::NoValue'
+          ClientSecret: !If
+            - UseExternalSecret
+            - !Ref 'AWS::NoValue'
+            - !Ref Auth0M2mClientSecret
+      Tags:
+        - {Key: project_name, Value: !Ref ProjectTagValue}
+
   HarnessRole:
     Type: AWS::IAM::Role
     Properties:
@@ -201,10 +219,8 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
                   - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
-              # ⚠️ ECR PUBLIC, not ECR: with no EnvironmentArtifact the harness pulls its
-              # MANAGED image from ECR Public — different service, different actions from
-              # the runtime role's private pull. Omit these and sessions fail at first
-              # invoke, not at deploy.
+              # ECR PUBLIC (not private): with no EnvironmentArtifact the harness pulls its
+              # MANAGED image from ECR Public. Omit these and sessions fail at first invoke.
               - Sid: EcrPublicTokenAccess
                 Effect: Allow
                 Action: 'ecr-public:GetAuthorizationToken'
@@ -239,9 +255,6 @@ Resources:
                 Resource: '*'
                 Condition:
                   StringEquals: {'cloudwatch:namespace': 'bedrock-agentcore'}
-              # The `harness_*` pattern here is the mechanical reason for the second
-              # consent: a vaulted token belongs to the workload identity that vaulted
-              # it, and this is neither the runtime's nor the gateway's.
               - Sid: WorkloadIdentity
                 Effect: Allow
                 Action:
@@ -255,21 +268,29 @@ Resources:
                 Action: 'bedrock-agentcore:InvokeGateway'
                 Resource: !ImportValue
                   'Fn::Sub': '${GatewayStackName}-ToolsGatewayArn'
-              # GetResourceOauth2Token authorizes against BOTH the token vault AND the
-              # calling workload identity; listing only the vault yields an AccessDenied
-              # naming the other. Same trap the runtime role documents.
+              # OAUTH is always on, so this is unconditional. GetResourceOauth2Token
+              # authorizes against BOTH the token vault AND the calling workload identity;
+              # listing only the vault yields an AccessDenied naming the other.
+              - Sid: OAuth2TokenAccess
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetResourceOauth2Token'
+                  - 'bedrock-agentcore:CompleteResourceTokenAuth'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/harness_${AgentName}*'
+              # EXTERNAL secret: AgentCore Identity reads the M2M client secret AS THIS
+              # ROLE while minting the outbound gateway token (GetResourceOauth2Token),
+              # so the role needs GetSecretValue on it — mirrors 02-runtime.yaml's
+              # ReadGithubClientSecret. Omit under MANAGED (the secret is vault-internal).
               - !If
-                - UseOauthOutbound
-                - Sid: OAuth2TokenAccess
+                - UseExternalSecret
+                - Sid: ReadM2mClientSecret
                   Effect: Allow
-                  Action:
-                    - 'bedrock-agentcore:GetResourceOauth2Token'
-                    - 'bedrock-agentcore:CompleteResourceTokenAuth'
-                  Resource:
-                    - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
-                    - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/*'
-                    - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
-                    - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/harness_${AgentName}*'
+                  Action: 'secretsmanager:GetSecretValue'
+                  Resource: !Ref Auth0M2mClientSecretArn
                 - !Ref 'AWS::NoValue'
               - !If
                 - UseMemory
@@ -292,30 +313,17 @@ Resources:
       HarnessName: !Sub '${AgentName}_harness'
       ExecutionRoleArn: !GetAtt HarnessRole.Arn
 
-      # Configuration, not a rebuilt container image — the headline benefit.
-      #
-      # ⚠️ NO Temperature, deliberately. The obvious setting for a citation-bound agent is
-      # a low temperature, and CFN accepts one (the schema allows 0-2) — but the DEPLOY
-      # SUCCEEDS and then every invocation dies inside the stream with
-      # "ValidationException ... `temperature` is deprecated for this model". Opus 4.8
-      # rejects the parameter outright. Observed, not theorised.
-      #
-      # That is the harness's sharpest edge: model parameters are validated by the MODEL
-      # at invoke time, not by CloudFormation at deploy time, so a green stack proves
-      # nothing about whether the agent can answer. Anything added here must be tested
-      # with a real InvokeHarness call.
+      # NO Temperature — Opus 4.8 rejects it at invoke time even though CFN accepts it, so
+      # a green stack would still fail every call. Model params are validated by the model,
+      # not by CloudFormation.
       Model:
         BedrockModelConfig:
           ModelId: !Ref BedrockModelId
           MaxTokens: !Ref MaxTokens
 
-      # ⚠️ DUPLICATED FROM agent/agent.py SYSTEM_PROMPT, unavoidably: a template cannot
-      # import a Python constant, and the harness never runs our container. Two copies of
-      # the grounding rules WILL drift, and drift degrades ONE path's citation discipline
-      # while the other stays correct. tests/test_harness_prompt.py fails when a
-      # load-bearing rule is dropped from either. Do not edit one without the other.
-      # Trimmed in one respect: the runtime's prompt names our three in-process tools,
-      # which do not exist here — the model sees the gateway's tool names instead.
+      # DUPLICATED FROM agent/agent.py SYSTEM_PROMPT — a template cannot import a Python
+      # constant and the harness never runs our container. tests/test_harness_prompt.py
+      # fails if a load-bearing rule drifts from either copy. Do not edit one alone.
       SystemPrompt:
         - Text: |
             You are Ripple, an enterprise knowledge assistant.
@@ -361,8 +369,9 @@ Resources:
 
             Confidence: HIGH | MEDIUM | LOW — <one short reason>
 
-      # One tool: the tools gateway. Every source is a target on it, so adding a source
-      # is a gateway change, not a harness change. No Drive tool — see M2 in the header.
+      # One tool: the tools gateway, reached with OAUTH outbound. Every source is a target
+      # on the gateway, so adding a source is a gateway change, not a harness change. No
+      # Drive tool — the harness cannot narrow a domain-wide key to one user (assessment §4).
       Tools:
         - Type: agentcore_gateway
           Name: !Sub '${AgentName}-tools'
@@ -370,44 +379,41 @@ Resources:
             AgentCoreGateway:
               GatewayArn: !ImportValue
                 'Fn::Sub': '${GatewayStackName}-ToolsGatewayArn'
-              OutboundAuth: !If
-                - UseOauthOutbound
-                - Oauth:
-                    ProviderArn: !Ref GatewayOauthProviderArn
-                    Scopes: !Ref GithubScopes
-                    GrantType: !Ref GatewayOauthGrantType
-                    DefaultReturnUrl: !Ref ConsentReturnUrl
-                - !If
-                  - UseAwsIamOutbound
-                  - AwsIam: {}
-                  - None: {}
+              # OAUTH-only — the one config MEASURED to load the tool. AWS_IAM/NONE
+              # both 401 at the CUSTOM_JWT gateway.
+              OutboundAuth:
+                Oauth:
+                  ProviderArn: !GetAtt GatewayAuth0Provider.CredentialProviderArn
+                  # EMPTY is correct — see GatewayOauthScopes. GitHub scopes here would be
+                  # wrong (Auth0 vocabulary, not GitHub's). An empty CommaDelimitedList is
+                  # [''] which fails the item minLength:1 (early-validation reject), so emit
+                  # a true empty [] when no scopes are set.
+                  Scopes: !If [HasGatewayScopes, !Ref GatewayOauthScopes, []]
+                  GrantType: CLIENT_CREDENTIALS
+                  # THE line that makes the outbound token a JWT the gateway accepts. Auth0
+                  # returns an opaque token without `audience`; the gateway's JWT authorizer
+                  # then 401s — a failure identical to the AWS_IAM/NONE one. Same value as
+                  # the authorizer's AllowedAudience below.
+                  CustomParameters:
+                    audience: !Ref Auth0Audience
 
-      # ⚠️ NO SHELL, NO FILE_OPERATIONS — a security decision. A harness grants both in
-      # EVERY session unless this field restricts them. A document-reading agent needs
-      # neither; a prompt injection carried inside a retrieved document does. Also
-      # removes ~900 input tokens of tool definitions from every model request.
+      # NO SHELL, NO FILE_OPERATIONS — a harness grants both in every session unless this
+      # restricts them. A document-reading agent needs neither; a prompt injection carried
+      # in a retrieved document does.
       AllowedTools:
         - !Sub '@${AgentName}-tools'
 
-      # ⚠️ Load-bearing here in a way it is not on the runtime: under SigV4 a harness does
-      # NOT propagate per-user identity downstream, so user-scoped vaulting and
-      # on-behalf-of exchange work ONLY on this bearer-JWT path. Dropping this authorizer
-      # would silently collapse every user's access onto one shared credential.
+      # Load-bearing: under SigV4 a harness does not propagate per-user identity, so the
+      # bearer-JWT authorizer is what keeps user-scoped vaulting working. Same issuer and
+      # audience as the tools gateway, by construction.
       AuthorizerConfiguration:
         CustomJWTAuthorizer:
           DiscoveryUrl: !Sub 'https://${Auth0Domain}/.well-known/openid-configuration'
           AllowedAudience: [!Ref Auth0Audience]
 
-      # ⚠️ The one place the harness is strictly better. 02-runtime provisions Memory and
-      # nothing reads or writes it (FR-18 has been open for that reason, and the diagram
-      # draws an RT->MEM arrow describing nothing). Here it is configuration.
-      #
-      # ⚠️ ActorId DELIBERATELY UNSET: setting it pins every caller to ONE memory
-      # partition — one shared conversation history across all users. Per-user
-      # partitioning comes from InvokeHarness's `actorId`, which is CALLER-CONTROLLED (a
-      # request field, not a claim), so the caller MUST derive it from the verified token
-      # `sub`. That is the header-vs-body trap _caller_jwt() exists to prevent,
-      # reappearing one layer up; client/ask.py is where to enforce it.
+      # ActorId DELIBERATELY UNSET — setting it pins every caller to one shared memory
+      # partition. Per-user partitioning comes from InvokeHarness's caller-controlled
+      # `actorId`, which client/ask.py must derive from the verified token `sub`.
       Memory: !If
         - UseMemory
         - AgentCoreMemoryConfiguration:
@@ -415,9 +421,6 @@ Resources:
             MessagesCount: 20
         - Disabled: {}
 
-      # A stateless-per-turn agent had no window to manage; a harness session is stateful
-      # by default and does. summarization would spend model calls compressing document
-      # text whose citations must stay verbatim, so drop oldest turns instead.
       Truncation:
         Strategy: sliding_window
         Config:
@@ -428,44 +431,32 @@ Resources:
       MaxTokens: !Ref MaxTokens
       TimeoutSeconds: !Ref TimeoutSeconds
 
-      # ⚠️ NO EnvironmentArtifact, and its absence is the point. Pointing it at our ECR
-      # image is the most natural-looking edit in this file and achieves nothing — the
-      # harness overrides ENTRYPOINT/CMD, so agent.py still would not run. It would only
-      # pull a 1GB image and add private-ECR permissions above. Add it only when a tool
-      # needs a binary present in the session filesystem.
+      # NO EnvironmentArtifact — the harness overrides ENTRYPOINT/CMD, so pointing it at our
+      # image would pull 1GB and still not run agent.py. Add only when a tool needs a binary
+      # in the session filesystem.
 
-      # A LIST of Key/Value here, unlike the runtime's Tags which is a MAP. Same word,
-      # different shape, same service.
       Tags:
         - {Key: project_name, Value: !Ref ProjectTagValue}
 
 Outputs:
   HarnessArn:
     Description: >
-      Set as RIPPLE_HARNESS_ARN. Invoke with InvokeHarness (the `bedrock-agentcore`
-      client) and an `Authorization: Bearer` header — not the runtime's /invocations
-      path, and not SigV4 unless you accept losing per-user identity entirely.
+      Set as RIPPLE_HARNESS_ARN. Invoke with InvokeHarness and an `Authorization: Bearer`
+      header (not the runtime's /invocations path, and not SigV4).
     Value: !GetAtt Harness.Arn
     Export:
       Name: !Sub '${AWS::StackName}-HarnessArn'
   HarnessId:
-    Description: >
-      For HarnessVersion / HarnessEndpoint resources, and the string the harness's own
-      workload identity and provisioned runtime are named after.
     Value: !GetAtt Harness.HarnessId
   HarnessVersion:
     Value: !GetAtt Harness.Version
+  GatewayAuth0ProviderArn:
+    Description: The stack-managed Auth0 provider the harness uses for outbound gateway auth.
+    Value: !GetAtt GatewayAuth0Provider.CredentialProviderArn
   ProvisionedRuntimeArn:
     Description: >
-      ⚠️ The runtime the harness created FOR ITSELF — read-only, and not the one
-      02-runtime.yaml manages. This is where the extra `harness_harness_*` runtime and
-      log group come from. Change it only via UpdateHarness.
+      The runtime the harness created FOR ITSELF (read-only) — not the one 02-runtime.yaml
+      manages. Source of the extra harness_* runtime and log group.
     Value: !GetAtt Harness.Environment.AgentCoreRuntimeEnvironment.AgentRuntimeArn
   HarnessRoleArn:
     Value: !GetAtt HarnessRole.Arn
-  ConsentRegistrationReminder:
-    Description: >
-      Run scripts/register_consent_url.py AFTER this stack. The harness is a THIRD
-      workload identity and its return-URL allowlist is empty until registered; the
-      failure is invisible until the moment after a user clicks Approve.
-    Value: !Sub 'python3 scripts/register_consent_url.py  # harness_${AgentName}*'
