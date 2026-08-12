@@ -18,7 +18,7 @@ account `146666888814`, model `us.anthropic.claude-opus-4-8`. botocore `1.43.56`
 
 | Mechanism | Source(s) | On the harness | Root cause |
 |---|---|---|---|
-| **M1 CONSENT** (3-legged OAuth) | GitHub | ⚠️ **Configurable but not working here** | Its one tool is the tools Gateway, whose inbound is `CUSTOM_JWT`. Both non-OAuth outbound values are refused `401`; the matching `OAUTH` value needs an Auth0 `client_credentials` client this project does not have. |
+| **M1 CONSENT** (3-legged OAuth) | GitHub | ✅ **Wired in the template and measured: tool loads, then M1 consent fires** | Its one tool is the tools Gateway, whose inbound is `CUSTOM_JWT`. Both non-OAuth outbound values were refused `401` (measured). The matching `OAUTH` value needs an Auth0 `client_credentials` client — now declared *as a stack resource*. Deployed-and-invoked: `InvokeHarness` returned `200`, the tool loaded, and the model reached the Gateway before the expected M1 consent elicitation. It authenticates the harness as a **machine**, not as the asking user, so it fixes tool loading, not §2 or M2. |
 | **M2 DELEGATION** (domain-wide delegation, signed assertion) | Google Drive / Docs | ❌ **Structurally impossible** | Gateway outbound auth is `{awsIam \| none \| oauth}` — none is "an assertion we sign". And a harness has **no `requestHeaderConfiguration`**, so nothing can read the caller's identity to narrow a domain-wide key to one user. |
 | **M3 TOKEN EXCHANGE** (RFC 8693 / ID-JAG) | MCP sources (target state) | ❌ **Not expressible in IaC; blocked upstream regardless** | The harness gateway tool's `grantType` includes `TOKEN_EXCHANGE` in the **API** but not in the **CloudFormation** enum. And the underlying ID-JAG gap in AgentCore Identity — it performs one hop and cannot request an ID-JAG — is unsolved on either path. |
 
@@ -66,22 +66,36 @@ The harness *can* express M1: a gateway tool with `outboundAuth.oauth` pointed a
 it drives its own consent (a **third** consent — the harness is its own workload identity;
 `scripts/register_consent_url.py` allowlists its return URL by prefix).
 
-It does not work in *this* deployment for a reason unrelated to M1 itself: the harness's only
-tool is our **tools Gateway**, whose inbound authorizer is `CUSTOM_JWT`. Loading that tool
-requires the harness to authenticate to the Gateway, and:
+On the earlier hand-built harness it did not work, for a reason unrelated to M1 itself: the
+harness's only tool is our **tools Gateway**, whose inbound authorizer is `CUSTOM_JWT`.
+Loading that tool requires the harness to authenticate to the Gateway, and:
 
 - `outboundAuth.awsIam` (SigV4) → **`401 Unauthorized`** at tool load (measured).
 - `outboundAuth.none` → **`401 Unauthorized`** at tool load (measured).
-- `outboundAuth.oauth` is the matching shape, but needs a credential provider for the
-  *Gateway's* issuer — an Auth0 `client_credentials` client. This project has only a public
-  CLI client (no secret), so that provider does not exist. Creating it is an Auth0-side
-  action, outside this repo.
+- `outboundAuth.oauth` is the matching shape. It needs a credential provider for the
+  *Gateway's* issuer — an Auth0 `client_credentials` client. `infra/04-harness.yaml` now
+  **declares that provider as a stack resource** (`AWS::BedrockAgentCore::OAuth2CredentialProvider`,
+  vendor `Auth0Oauth2`) and references it from the tool's `outboundAuth.oauth` with
+  `grantType: CLIENT_CREDENTIALS` and `customParameters.audience` (without the audience Auth0
+  returns an *opaque* token and the Gateway 401s identically). This closes the dead end in
+  IaC — there is no longer a hand-run script or a missing provider.
 
-So M1 on the harness is **blocked on an IdP-side credential, not on AWS**. Until it exists
-the harness answers every question at LOW confidence with no sources, and — noted as its own
-defect — **does not surface the tool-load failure to the user**. The template keeps
-`AWS_IAM` as the least-surprising no-credential default; read it as *not yet wired*, not
-*verified*.
+A third requirement surfaced only on the first stack-managed invoke: under
+`ClientSecretSource=EXTERNAL`, AgentCore Identity reads the M2M secret **as the harness
+execution role** while minting the outbound token, so that role needs
+`secretsmanager:GetSecretValue` on the secret ARN (mirroring the runtime's GitHub grant).
+Omit it and the tool load fails with an `AccessDeniedException` on `GetResourceOauth2Token`,
+not a `401` — a different-looking symptom for the same "tool won't load" outcome.
+
+Two things to keep straight. (a) The stack-managed form is now **deployed-and-invoked**:
+`InvokeHarness` returned `200`, `ripple-tools` loaded, and the model called Gateway tools
+(`github___github_get_user`, `github___github_list_orgs`) before the expected M1 consent
+elicitation — so the tool-load success is *measured*, not merely expected (a green stack
+still does not prove it — §6 — but a `200` from invoke does). (b) `client_credentials`
+authenticates the harness as a **machine**; it does not carry the caller's identity to the
+Gateway, so it fixes tool *loading* only and leaves §2 (caller-replaceable guardrails) and
+M2 (no per-user narrowing) exactly as they were. It was also noted as its own defect that a
+tool-load failure **is not surfaced to the user** — the harness just answers with no sources.
 
 ---
 

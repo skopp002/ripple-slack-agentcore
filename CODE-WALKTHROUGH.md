@@ -648,7 +648,10 @@ This fail-closed behavior is essential because domain-wide delegation can author
 
 `infra/04-harness.yaml` deploys the same product as `AWS::BedrockAgentCore::Harness`: model,
 system prompt, tools, memory and iteration ceilings become configuration and **AWS runs the
-agent loop**. It is deployed and answering (`ripple_harness-5tCOqF76a2`).
+agent loop**. The template is fully stack-managed — it also declares the Auth0 credential
+provider the harness uses to reach the tools Gateway, so nothing is created or patched
+outside the stack. An earlier hand-built harness (`ripple_harness-5tCOqF76a2`) was deployed
+and answering, and is the source of the measured facts below.
 
 **It is a second, parallel agent — not a migration.** Two different things share the word
 "harness": `bedrock_agentcore.runtime.BedrockAgentCoreApp`, which `agent.py` uses, is a server
@@ -695,11 +698,23 @@ is dropped from either copy.
 1. `Temperature: 0.2` passed the CFN schema and then failed *every* call with
    `` `temperature` is deprecated for this model ``. Model parameters are validated by the
    model at invoke time; anything added to `Model` needs a real call.
-2. The Gateway tool returns `401 Unauthorized` at load. The tools Gateway is `CUSTOM_JWT`
-   inbound, so both `AWS_IAM` and `NONE` are refused (both tested). `OAUTH` is the matching
-   value and is wired, but needs an Auth0 `client_credentials` client this project does not
-   have — an Auth0-side action. Read `AWS_IAM` as *not yet wired*. The harness does not
-   surface this to the user; it just answers at LOW confidence with no sources.
+2. The Gateway tool returned `401 Unauthorized` at load on the earlier hand-built harness.
+   The tools Gateway is `CUSTOM_JWT` inbound, so both `AWS_IAM` and `NONE` are refused (both
+   tested). `OAUTH` is the matching value, and `04-harness.yaml` now declares its Auth0
+   `client_credentials` provider **as a stack resource** and wires the tool to it with
+   `grantType: CLIENT_CREDENTIALS` and `customParameters.audience` (without the audience Auth0
+   returns an opaque token and the Gateway 401s the same way). One more thing the
+   stack-managed form surfaced on first invoke: under `ClientSecretSource=EXTERNAL` AgentCore
+   Identity reads the M2M secret **as the harness execution role**, so that role needs
+   `secretsmanager:GetSecretValue` on the secret ARN — omit it and the load fails with an
+   `AccessDeniedException` on `GetResourceOauth2Token`, not a `401`. With all three in place
+   the stack-managed harness was **deployed and invoked**: `InvokeHarness` returned `200`,
+   `ripple-tools` loaded, and the model called Gateway tools before the expected M1 consent
+   elicitation — so the tool-load success is now *measured*, not merely expected. It still
+   authenticates the harness as a **machine**, not as the asking user, so it fixes tool
+   loading only; it is not the M2 fix and does not change the per-request-defaults finding
+   below. When the earlier harness failed to load the tool it also did not surface that to
+   the user — it answered at LOW confidence with no sources.
 3. SigV4 is refused outright (`This harness requires OAuth Bearer token authentication`).
    boto3 needs the signer *disabled* (`Config(signature_version=UNSIGNED)`) before an
    `Authorization` header survives. This matters beyond ergonomics: on a harness *without* an
@@ -726,7 +741,7 @@ invoke time was characterised separately; the summary in
 [`docs/HARNESS-ASSESSMENT.md`](docs/HARNESS-ASSESSMENT.md) states the conclusion without the
 reproduction.
 
-Finally, the harness is its **own workload identity** — `harness_ripple_harness-ejdAHhBoDB`,
+Finally, the harness is its **own workload identity** — `harness_ripple_harness-X2kkImB9ZZ`,
 where the `harness_` prefix is literal and the service appends a random suffix, so the name
 cannot be derived. A user who connected GitHub on the runtime or on the Gateway route has not
 consented here: that is a third consent, and `scripts/register_consent_url.py` discovers this

@@ -44,6 +44,7 @@ all with `tagOnCreate: true`):
 | Runtime role | `AWS::IAM::Role` | `02-runtime.yaml` |
 | Ingress + tools Gateways, targets | `AWS::BedrockAgentCore::Gateway`, `GatewayTarget` | `03-gateways.yaml` |
 | Managed harness + its role | `AWS::BedrockAgentCore::Harness`, `AWS::IAM::Role` | `04-harness.yaml` |
+| Harness→gateway Auth0 M2M provider | `AWS::BedrockAgentCore::OAuth2CredentialProvider` (vendor `Auth0Oauth2`) | `04-harness.yaml` |
 | ECR repo | `AWS::ECR::Repository` | `01-foundation.yaml` |
 | CodeBuild + role | `AWS::CodeBuild::Project`, `AWS::IAM::Role` | `01-foundation.yaml` |
 | Build source bucket | `AWS::S3::Bucket` | `01-foundation.yaml` |
@@ -92,7 +93,7 @@ declares.
   by `apply_tags.py`. Avoid entirely by using `GithubClientSecretArn` (see below).
 - **The harness's own runtime, and its workload identity** — a harness provisions a runtime
   underneath itself, named `harness_<harnessName>` (note the doubled word: the prefix is
-  literal). `ripple_harness` produced runtime `harness_ripple_harness-ejdAHhBoDB` plus a
+  literal). `ripple_harness` produced runtime `harness_ripple_harness-X2kkImB9ZZ` plus a
   workload identity of the same name. Both are read-only children of the harness — exposed
   as `Harness.Environment.AgentCoreRuntimeEnvironment.AgentRuntimeArn` — and are where the
   otherwise-unexplained `harness_*` runtime and log group in an account come from. Change
@@ -352,6 +353,54 @@ Notes:
 Passed as a `NoEcho` parameter; AgentCore Identity then creates and owns its own
 Secrets Manager secret. `NoEcho` masks console display, but the value is still
 submitted to CloudFormation. Use only if you cannot pre-create a secret.
+
+## The harness M2M client secret
+
+Only needed with `DEPLOY_HARNESS=true`. The harness reaches the `CUSTOM_JWT` tools
+Gateway with an Auth0 `client_credentials` token, and `04-harness.yaml` declares
+that Auth0 credential provider **as a stack resource** — so, exactly like the GitHub
+secret above, the provider needs the M2M app's client secret, and the preferred way
+to supply it is a Secrets Manager ARN (`Auth0M2mClientSecretArn`), never a raw
+CloudFormation parameter. `deploy.py` refuses to deploy the harness without it.
+
+**Step 1 — get the secret from Auth0.** Auth0 dashboard → *Applications* → your
+Machine-to-Machine app (client ID in `dev.env` as `AUTH0_M2M_CLIENT_ID`) →
+*Settings* → **Client Secret**. This is the M2M app authorized for the API whose
+identifier is `AUTH0_AUDIENCE` — not the public CLI client, which has no secret and
+cannot do `client_credentials`.
+
+**Step 2 — put it in your shell, not in a file** (leading space keeps it out of
+history):
+
+```bash
+ export AUTH0_M2M_CLIENT_SECRET='paste-the-value-here'
+```
+
+**Step 3 — create the secret** (JSON, so a `JsonKey` can name the field):
+
+```bash
+aws secretsmanager create-secret \
+  --name ripple/m2m-auth0 \
+  --description "Auth0 M2M client secret — Ripple harness -> tools gateway" \
+  --secret-string "{\"client_secret\":\"$AUTH0_M2M_CLIENT_SECRET\"}" \
+  --tags Key=project_name,Value=ripple_slack_assistant \
+  --region "$AWS_REGION" \
+  --query ARN --output text
+```
+
+**Step 4 — point `dev.env` at the ARN it printed** (the ARN is not a secret):
+
+```bash
+export AUTH0_M2M_CLIENT_SECRET_ARN=arn:aws:secretsmanager:us-west-2:<account-id>:secret:ripple/m2m-auth0-AbCdEf
+export AUTH0_M2M_CLIENT_SECRET_JSON_KEY=client_secret   # matches the key used above
+```
+
+`deploy.py` passes these to the harness stack as `Auth0M2mClientSecretArn` /
+`Auth0M2mClientSecretJsonKey`; the template reads the secret as the caller
+(`ClientSecretSource=EXTERNAL`). Rotating it later is a `put-secret-value` in place —
+the ARN and the provider are unchanged, so no redeploy. The template also has a
+`NoEcho` MANAGED fallback (`Auth0M2mClientSecret`), but `deploy.py` will not use it:
+it errors rather than store the secret in the stack.
 
 ## ⚠️ Replacing the credential provider changes the GitHub callback URL
 
