@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html><head><style id="qw-theme">:root {
+  --color-bg: #faf9fc;
+  --color-text: #131920;
+  --color-navbar-bg: #f9f9fb;
+  --color-bg-chat-view: #fcfcfd;
+  --color-bg-secondary: #fff;
+  --color-bg-tertiary: #f9fafb;
+  --color-bg-hover: #f3f4f6;
+  --color-surface: #f9fafb;
+  --color-surface-hover: #f3f4f6;
+  --color-surface-active: #e5e7eb;
+  --color-border: #0000001f;
+  --color-border-light: #0000000f;
+  --color-border-strong: #d1d5db;
+  --color-primary: #4200db;
+  --color-primary-dark: #35009e;
+  --color-primary-light: #8575ff;
+  --color-primary-bg: #e8e6ff;
+  --color-primary-hover-border: #35009e;
+  --color-nav-icon-active: #4200db;
+  --color-nav-hover-border: #4200db;
+  --color-primary-alpha-3: color-mix(in srgb, #4200db 3%, transparent);
+  --color-primary-alpha-5: color-mix(in srgb, #4200db 5%, transparent);
+  --color-primary-alpha-8: color-mix(in srgb, #4200db 8%, transparent);
+  --color-primary-alpha-12: color-mix(in srgb, #4200db 12%, transparent);
+  --color-primary-alpha-15: color-mix(in srgb, #4200db 15%, transparent);
+  --color-primary-alpha-20: color-mix(in srgb, #4200db 20%, transparent);
+  --color-primary-alpha-25: color-mix(in srgb, #4200db 25%, transparent);
+  --color-primary-alpha-30: color-mix(in srgb, #4200db 30%, transparent);
+  --color-primary-alpha-40: color-mix(in srgb, #4200db 40%, transparent);
+  --color-primary-alpha-50: color-mix(in srgb, #4200db 50%, transparent);
+  --color-primary-alpha-60: color-mix(in srgb, #4200db 60%, transparent);
+  --color-primary-subtle: color-mix(in srgb, #4200db 12%, transparent);
+  --color-primary-border: color-mix(in srgb, #4200db 30%, transparent);
+  --color-focus-ring: color-mix(in srgb, #4200db 50%, transparent);
+  --color-sidebar-hover: color-mix(in srgb, #4200db 12%, transparent);
+  --block-hover-outline: 1px dashed color-mix(in srgb, #4200db 50%, transparent);
+  --block-selected-outline: 1px solid #8575ff;
+  --block-selection-outline-offset: 2px;
+  --block-selected-halo: 0 0 8px color-mix(in srgb, #4200db 40%, transparent);
+  --color-accent: #4200db;
+  --color-accent-foreground: #4200db;
+  --color-accent-dark: #35009e;
+  --color-accent-light: #e8e6ff;
+  --color-accent-inverse: #fff;
+  --color-link: #4200db;
+  --color-primary-gradient-end: #e8e6ff;
+  --color-primary-bg-solid: #e8e6ff;
+  --color-user-bubble: #f3f3f7;
+  --color-user-bubble-text: #131920;
+  --color-text-secondary: #5e5e5e;
+  --color-text-tertiary: #656871;
+  --color-text-muted: #9ca3af;
+  --color-text-on-primary: #fff;
+  --color-success: #00802f;
+  --color-success-dark: #00471e;
+  --color-success-light: #d9ffd6;
+  --color-success-hover: #005c26;
+  --color-success-bg: #e6f5eb;
+  --color-success-border: #b3d9bf;
+  --color-success-foreground: #00802f;
+  --color-success-dark-foreground: #00471e;
+  --color-success-text: #00471e;
+  --color-error: #db0000;
+  --color-error-dark: #700000;
+  --color-error-light: #ffe0e0;
+  --color-error-hover: #ffe0e0;
+  --color-error-bg: #fceaea;
+  --color-error-border: #f2cccc;
+  --color-error-active-border: #db0000;
+  --color-error-foreground: #db0000;
+  --color-error-dark-foreground: #700000;
+  --color-error-inverse: #fff;
+  --color-error-text: #700000;
+  --color-warning: #f2b100;
+  --color-warning-dark: #573a00;
+  --color-warning-light: #fffbbd;
+  --color-warning-hover: #db9200;
+  --color-warning-bg: #fef7e6;
+  --color-warning-border: #f9dfa3;
+  --color-warning-foreground: #f2b100;
+  --color-warning-dark-foreground: #573a00;
+  --color-warning-inverse: #573a00;
+  --color-surface-warning: #fffbbd;
+  --color-text-warning: #573a00;
+  --color-info: #006ce0;
+  --color-info-dark: #002a66;
+  --color-info-light: #d1f1ff;
+  --color-info-hover: #003b8f;
+  --color-info-bg: #ebf3fc;
+  --color-info-border: #b3d1f0;
+  --color-info-foreground: #006ce0;
+  --color-info-dark-foreground: #002a66;
+  --color-info-inverse: #fff;
+  --color-overlay: #00000080;
+  --color-shadow: #00000014;
+  --color-hover: #0000000d;
+  --color-tooltip-bg: #000000d9;
+  --color-tooltip-text: #fff;
+  --color-voice-purple: #8575ff;
+  --color-voice-purple-dark: #4200db;
+  --color-voice-purple-light: #8575ff;
+  --color-voice-red: #db0000;
+  --color-voice-red-dark: #700000;
+  --color-voice-amber: #f2b100;
+  --color-voice-purple-glow: #4200db66;
+  --color-voice-red-glow: #db000066;
+  --font-sans: "Amazon Ember", "Helvetica Neue", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SF Mono", "Monaco", "Menlo", "Consolas", monospace;
+  --text-2xs: .5625rem;
+  --text-xs: .625rem;
+  --text-sm: .6875rem;
+  --text-base: .75rem;
+  --text-md: .8125rem;
+  --text-lg: .875rem;
+  --text-xl: 1rem;
+  --text-2xl: 1.125rem;
+  --text-3xl: 1.25rem;
+  --text-4xl: 1.5rem;
+  --text-5xl: 2rem;
+  --spacing-1: calc(.25rem * 1);
+  --spacing-1-5: calc(.25rem * 1.5);
+  --spacing-2: calc(.25rem * 2);
+  --spacing-3: calc(.25rem * 3);
+  --spacing-4: calc(.25rem * 4);
+  --spacing-5: calc(.25rem * 5);
+  --spacing-6: calc(.25rem * 6);
+  --spacing-7: calc(.25rem * 7);
+  --spacing-8: calc(.25rem * 8);
+  --spacing-9: calc(.25rem * 9);
+  --spacing-10: calc(.25rem * 10);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-card: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 8px;
+  --shadow-sm: 0 1px 2px #0000000d;
+  --shadow-md: 0 4px 12px #00000014;
+  --color-success-bg-solid: #d9ffd6;
+  --color-error-bg-solid: #ffe0e0;
+  --color-error-border-solid: #ffe0e0;
+  --color-warning-bg-solid: #fffbbd;
+  --color-warning-text: #573a00;
+  --color-info-bg-solid: #d1f1ff;
+  --color-info-bg-solid-alt: #d1f1ff;
+  --color-info-text: #002a66;
+  --color-info-text-alt: #002a66;
+  --color-emerald: #10b981;
+  --color-teal: #4ecdc4;
+  --color-code-bg: #f3f3f7;
+  --color-code-header-bg: #f1f3f5;
+  --color-code-text: #24292e;
+  --color-code-border: #e1e4e8;
+  --color-code-muted: #6a737d;
+  --color-inline-code-bg: #f3f3f7;
+  --color-inline-code-text: #24292e;
+  --color-inline-code-border: #e1e4e8;
+  --color-scrollbar-thumb: #d1d5db;
+  --color-scrollbar-track: transparent;
+  --color-graph-node-text: #333;
+  --color-graph-node-text-dim: #7f8c8d;
+  --color-graph-edge-default: #95a5a6;
+  --color-graph-edge-cross: #e67e22;
+  --color-graph-edge-text: #666;
+  --color-graph-edge-stroke: #fff;
+  --color-graph-highlight-bg: #ff6b6b;
+  --color-graph-highlight-border: #e74c3c;
+  --color-graph-search-bg: gold;
+  --color-graph-search-border: orange;
+  --color-graph-focus-border: #c0392b;
+  --color-graph-external-border: #95a5a6;
+  --color-graph-cat-file: #3498db;
+  --color-graph-cat-folder: #7f8c8d;
+  --color-graph-cat-file-aggregate: #2980b9;
+  --color-graph-cat-class: #9b59b6;
+  --color-graph-cat-function: #2ecc71;
+  --color-graph-cat-method: #1abc9c;
+  --color-graph-cat-variable: #f39c12;
+  --color-graph-cat-import: #d35400;
+  --color-graph-cat-module: #5b6abf;
+  --color-graph-cat-concept: #e74c3c;
+  --color-graph-cat-person: #ff6b6b;
+  --color-graph-cat-org: #4ecdc4;
+  --color-graph-cat-organization: #4ecdc4;
+  --color-graph-cat-product: #a29bfe;
+  --color-graph-cat-metric: #fd79a8;
+  --color-graph-cat-location: #34495e;
+  --color-graph-cat-date: #e056a0;
+  --color-graph-cat-code: #3498db;
+  --color-graph-cat-doc: #7f8c8d;
+  --color-graph-cat-url: #00b894;
+  --color-graph-cat-email: #6c5ce7;
+  --color-graph-cat-unknown: #bdc3c7;
+  --color-graph-rel-contains: #bdc3c7;
+  --color-graph-rel-extends: #9b59b6;
+  --color-graph-rel-implements: #3498db;
+  --color-graph-rel-imports: #e67e22;
+  --color-graph-rel-uses: #2ecc71;
+  --color-graph-rel-calls: #27ae60;
+  --color-graph-rel-references: #f39c12;
+  --color-graph-rel-related-to: #95a5a6;
+  --color-graph-rel-works-on: #e74c3c;
+  --color-graph-rel-owns: #1abc9c;
+  --color-graph-rel-depends-on: #e67e22;
+  --color-graph-rel-parent-of: #bdc3c7;
+  --qs-content: #fff;
+  --qs-main: #fff;
+  --qs-primary-foreground: #131920;
+  --qs-secondary-foreground: #656871;
+  --qs-tertiary-foreground: #9ca3af;
+  --qs-placeholder-foreground: #8c8c94;
+  --qs-divider: #dedee3;
+  --qs-default-border: #8c8c94;
+  --qs-neutral-soft: #b4b4bb;
+  --qs-neutral-gray-50: #f9fafb;
+  --qs-tertiary-background: #f9fafb;
+  --qs-action-hover: #f3f3f7;
+  --qs-primary-default: #4200db;
+  --qs-primary-dark: #35009e;
+  --qs-primary-light: #e8e6ff;
+  --qs-success-default: #00802f;
+  --qs-error-default: #db0000;
+  --qs-font-sans: "Amazon Ember", "Helvetica Neue", "Segoe UI", Helvetica, Arial, sans-serif;
+  --safe-top: 0px;
+  --safe-bottom: 0px;
+  --safe-left: 0px;
+  --safe-right: 0px;
+  --qs-font-family: "Amazon Ember", "Helvetica Neue", "Segoe UI", Helvetica, Arial, sans-serif;
+  --qs-font-base-letter-spacing: .15px;
+  --qs-shadow-sm: 0 0 2px 0 #00000029, 0 0 4px 0 #00000029;
+  --qs-shadow-md: 0 0 2px 0 #00000029, 0 2px 8px 1px #00000029;
+  --qs-shadow-lg: 0 4px 16px 4px #00000029, 0 2px 6px 1px #00000029;
+  --qs-shadow-xl: 0 4px 8px 2px #00000029, 0 6px 20px 4px #00000029;
+  --qs-width-modal-sm: 384px;
+  --qs-width-modal-md: 600px;
+  --qs-width-modal-lg: 1136px;
+  --qs-grid-gap: 16px;
+  --qs-grid-gap-xl: 24px;
+  --qs-primary-medium: #8575ff;
+  --qs-primary-inverse: #fff;
+  --qs-neutral-lightest: #f9f9fb;
+  --qs-neutral-light: #f3f3f7;
+  --qs-neutral-default: #dedee3;
+  --qs-neutral-medium: #8c8c94;
+  --qs-neutral-deep: #656871;
+  --qs-neutral-dark: #333843;
+  --qs-neutral-strong: #131920;
+  --qs-neutral-white: #fff;
+  --qs-neutral-black: #000;
+  --qs-success-medium: #005c26;
+  --qs-success-dark: #00471e;
+  --qs-success-light: #d9ffd6;
+  --qs-success-inverse: #fff;
+  --qs-info-default: #006ce0;
+  --qs-info-medium: #003b8f;
+  --qs-info-dark: #002a66;
+  --qs-info-light: #d1f1ff;
+  --qs-info-inverse: #fff;
+  --qs-warning-default: #f2b100;
+  --qs-warning-medium: #db9200;
+  --qs-warning-dark: #573a00;
+  --qs-warning-light: #fffbbd;
+  --qs-warning-inverse: #573a00;
+  --qs-warning-experimental: #f2b100;
+  --qs-warning-experimental-light: #fffbbd;
+  --qs-warning-experimental-light-foreground: #fffbbd;
+  --qs-error-medium: #900;
+  --qs-error-dark: #700000;
+  --qs-error-light: #ffe0e0;
+  --qs-error-inverse: #fff;
+  --qs-connection-default: #db3300;
+  --qs-connection-soft: #ff997a;
+  --qs-connection-light: #ffe0d6;
+  --qs-connection-dark: #661800;
+  --qs-automation-default: #b3008f;
+  --qs-automation-medium: #d600ba;
+  --qs-automation-soft: #ff94f1;
+  --qs-automation-light: #ffe0fb;
+  --qs-automation-dark: #660052;
+  --qs-insight-default: #a000b8;
+  --qs-insight-soft: #f299ff;
+  --qs-insight-light: #fce6ff;
+  --qs-insight-dark: #590066;
+  --qs-visualization-default: #7300e5;
+  --qs-visualization-soft: #d4a8ff;
+  --qs-visualization-light: #f2e5ff;
+  --qs-visualization-dark: #45008a;
+  --qs-spice: #ff9800;
+  --qs-coachmark: #006ce0;
+  --qs-brand: #fff;
+  --qs-brand-foreground: #131920;
+  --qs-brand-navbar: #131920;
+  --qs-brand-navbar-foreground: #fff;
+  --qs-brand-navbar-light: #dedee3;
+  --qs-brand-navbar-dark: #000;
+  --qs-application-navbar: #4200db;
+  --qs-application-navbar-foreground: #fff;
+  --qs-application-navbar-light: #e8e6ff;
+  --qs-application-navbar-dark: #35009e;
+  --qs-dimension: #4200db;
+  --qs-dimension-foreground: #fff;
+  --qs-dimension-experimental: #4200db;
+  --qs-dimension-experimental-foreground: #4200db;
+  --qs-measure: #00802f;
+  --qs-measure-foreground: #fff;
+  --qs-measure-experimental: #f2b100;
+  --qs-measure-experimental-foreground: #f2b100;
+  --qs-content-inverse: #333843;
+  --qs-content-inverse-active: #131920;
+  --qs-secondary: #dedee3;
+  --qs-disabled: #8c8c94;
+  --qs-divider-light: #f3f3f7;
+  --qs-hover-border: #333843;
+  --qs-active-border: #4200db;
+  --qs-disabled-border: #dedee3;
+  --qs-error-border: #ffe0e0;
+  --qs-error-active-border: #db0000;
+  --qs-disabled-foreground: #b4b4bb;
+  --qs-primary-inverse-foreground: #fff;
+  --qs-error-foreground: #db0000;
+  --qs-contrast-foreground: #131920;
+  --qs-main-foreground: #131920;
+  --qs-main-secondary-foreground: #656871;
+  --qs-action-disabled: #f3f3f7;
+  --qs-action-active: #e8e6ff;
+  --qs-default-badge: #dedee3;
+  --qs-tag-default: #dedee3;
+  --qs-tag-soft-border: #b4b4bb;
+  --qs-focus-offset: 1px;
+  --qs-toggle-tile-sm: calc(.25rem * 8);
+  --qs-toggle-tile-md: calc(.25rem * 12);
+  --qs-toggle-tile-lg: calc(.25rem * 15);
+  --qs-shadow-pin-right: inset 4px 0 4px -4px #00000029;
+  --qs-shadow-pin-left: inset -4px 0 4px -4px #00000029;
+  --react-pdf-text-layer: 1;
+  --highlight-bg-color: #b400aa;
+  --highlight-selected-bg-color: #006400;
+  --react-pdf-annotation-layer: 1;
+  --annotation-unfocused-field-background: url("data:image/svg+xml;charset=UTF-8,<svg width='1px' height='1px' xmlns='http://www.w3.org/2000/svg'><rect width='100%' height='100%' style='fill:rgba(0, 54, 255, 0.13);'/></svg>");
+  --input-focus-border-color: Highlight;
+  --input-focus-outline: 1px solid Canvas;
+  --input-unfocused-border-color: transparent;
+  --input-disabled-border-color: transparent;
+  --input-hover-border-color: black;
+  --link-outline: none;
+  color-scheme: light;
+}
+body { background: var(--color-bg); color: var(--color-text); }
+a { color: var(--color-link, var(--color-primary)); }</style>
+<meta charset="UTF-8">
+<style>
+body {
+  background: var(--color-bg);
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  margin: 0;
+  padding: 24px;
+}
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+}
+.subtitle {
+  color: var(--color-text-muted);
+  font-size: 13px;
+  margin-bottom: 24px;
+}
+.diagram-container {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: 12px;
+  padding: 32px 16px;
+  overflow-x: auto;
+}
+svg text {
+  font-family: var(--font-sans);
+}
+.zone-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.node-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-anchor: middle;
+}
+.node-sublabel {
+  font-size: 8.5px;
+  fill: var(--color-text-muted, #8993a4);
+  text-anchor: middle;
+}
+.edge-number {
+  font-family: var(--font-mono, 'SF Mono', Consolas, monospace);
+  font-size: 9.5px;
+  font-weight: 700;
+  fill: #fff;
+  text-anchor: middle;
+}
+.edge-num-bg { fill: #0052CC; }
+.edge-label-text {
+  font-size: 8px;
+  fill: var(--color-text-secondary, #44546f);
+}
+/* Legend */
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 24px 0 10px 0;
+}
+.legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 6px;
+}
+.legend-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 12px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.legend-num {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: #fff;
+  background: #0052CC;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+}
+.legend-num.alt { background: #7c3aed; }
+.legend-text { color: var(--color-text-secondary); }
+.legend-text strong { color: var(--color-text); font-weight: 600; }
+.legend-text code {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: 3px;
+  padding: 0 3px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+.note-box {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  padding: 14px 16px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 20px;
+  line-height: 1.5;
+}
+.note-box strong { color: var(--color-text); }
+.path-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.path-a { background: #dbeafe; color: #1d4ed8; }
+.path-b { background: #ede9fe; color: #6d28d9; }
+</style>
+</head>
+<body>
+<h1>Ripple Slack → AgentCore: Full Architecture with Ingress Gateway + Harness</h1>
+<p class="subtitle">
+  <span class="path-badge path-a">Path A</span> Primary: Slack → Ingress GW → Runtime (delegation + consent)
+  &nbsp;&nbsp;
+  <span class="path-badge path-b">Path B</span> Exploratory: Slack → Ingress GW → Harness (consent only, no delegation)
+</p>
+
+<div class="diagram-container">
+<svg viewBox="0 0 1100 600" width="1100" height="600">
+  <defs>
+    <marker id="arr-blue" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#0052CC"></path>
+    </marker>
+    <marker id="arr-purple" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#7c3aed"></path>
+    </marker>
+    <marker id="arr-orange" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#c77600"></path>
+    </marker>
+    <marker id="arr-green" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#16a34a"></path>
+    </marker>
+    <marker id="arr-amber" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#d97706"></path>
+    </marker>
+    <marker id="arr-grey" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5 Z" fill="#666"></path>
+    </marker>
+  </defs>
+
+  <!-- ===== ZONES ===== -->
+  <!-- Slack -->
+  <rect x="15" y="15" width="170" height="200" rx="10" fill="none" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.7"></rect>
+  <text class="zone-label" x="28" y="32" fill="#7c3aed">Slack</text>
+
+  <!-- Ripple Middleware -->
+  <rect x="215" y="15" width="200" height="565" rx="10" fill="none" stroke="#0052CC" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.7"></rect>
+  <text class="zone-label" x="228" y="32" fill="#0052CC">Ripple Middleware</text>
+
+  <!-- AWS AgentCore -->
+  <rect x="445" y="15" width="640" height="565" rx="10" fill="none" stroke="#FF9900" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.7"></rect>
+  <text class="zone-label" x="458" y="32" fill="#c77600">AWS — Amazon Bedrock AgentCore</text>
+
+  <!-- Ingress GW sub-zone -->
+  <rect x="465" y="50" width="160" height="380" rx="8" fill="#fff8f0" stroke="#FF9900" stroke-width="1" opacity="0.5"></rect>
+  <text x="478" y="66" font-size="9" font-weight="600" fill="#c77600">Ingress Gateway</text>
+  <text x="478" y="77" font-size="7.5" fill="#c77600" opacity="0.7">HTTP (no ProtocolType)</text>
+  <text x="478" y="87" font-size="7.5" fill="#c77600" opacity="0.7">JWT_PASSTHROUGH outbound</text>
+
+  <!-- Runtime sub-zone -->
+  <rect x="655" y="50" width="200" height="230" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1" opacity="0.5"></rect>
+  <text x="668" y="66" font-size="9" font-weight="600" fill="#16a34a">AgentCore Runtime</text>
+  <text x="668" y="77" font-size="7.5" fill="#16a34a" opacity="0.7">CUSTOM_JWT authorizer</text>
+
+  <!-- Harness sub-zone -->
+  <rect x="655" y="310" width="200" height="130" rx="8" fill="#faf5ff" stroke="#7c3aed" stroke-width="1" opacity="0.5"></rect>
+  <text x="668" y="326" font-size="9" font-weight="600" fill="#7c3aed">AgentCore Harness</text>
+  <text x="668" y="337" font-size="7.5" fill="#7c3aed" opacity="0.7">Managed loop (no agent.py)</text>
+  <text x="668" y="347" font-size="7.5" fill="#7c3aed" opacity="0.7">⚠️ No delegation (M2)</text>
+
+  <!-- Tools GW sub-zone -->
+  <rect x="890" y="50" width="175" height="380" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1" opacity="0.5"></rect>
+  <text x="903" y="66" font-size="9" font-weight="600" fill="#d97706">Tools Gateway</text>
+  <text x="903" y="77" font-size="7.5" fill="#d97706" opacity="0.7">ProtocolType: MCP</text>
+  <text x="903" y="87" font-size="7.5" fill="#d97706" opacity="0.7">OAUTH outbound per source</text>
+
+  <!-- Sources zone -->
+  <rect x="890" y="460" width="175" height="105" rx="8" fill="none" stroke="#666" stroke-width="1" stroke-dasharray="4,3" opacity="0.5"></rect>
+  <text x="903" y="476" font-size="9" font-weight="600" fill="#666">External Sources</text>
+
+  <!-- ===== NODES ===== -->
+  <!-- User -->
+  <rect x="35" y="55" width="130" height="42" rx="7" fill="#f3e8ff" stroke="#7c3aed" stroke-width="1.5"></rect>
+  <text class="node-label" x="100" y="74" fill="#7c3aed">👤 Ripple User</text>
+  <text class="node-sublabel" x="100" y="87">Signed into Slack (Okta)</text>
+
+  <!-- Bot -->
+  <rect x="35" y="125" width="130" height="42" rx="7" fill="#f3e8ff" stroke="#7c3aed" stroke-width="1.5"></rect>
+  <text class="node-label" x="100" y="144" fill="#7c3aed">🤖 Slack Bot</text>
+  <text class="node-sublabel" x="100" y="157">@KnowledgeAssistant</text>
+
+  <!-- Event Handler -->
+  <rect x="235" y="55" width="160" height="42" rx="7" fill="#dbeafe" stroke="#0052CC" stroke-width="1.2"></rect>
+  <text class="node-label" x="315" y="74" fill="#1d4ed8">Event Handler</text>
+  <text class="node-sublabel" x="315" y="87">Verify Slack signature</text>
+
+  <!-- Identity Resolver -->
+  <rect x="235" y="130" width="160" height="42" rx="7" fill="#dbeafe" stroke="#0052CC" stroke-width="1.2"></rect>
+  <text class="node-label" x="315" y="149" fill="#1d4ed8">Identity Resolver</text>
+  <text class="node-sublabel" x="315" y="162">user_id → email</text>
+
+  <!-- JWT Minter -->
+  <rect x="235" y="210" width="160" height="42" rx="7" fill="#dbeafe" stroke="#0052CC" stroke-width="1.2"></rect>
+  <text class="node-label" x="315" y="229" fill="#1d4ed8">JWT Minter (RS256)</text>
+  <text class="node-sublabel" x="315" y="242">sub=email, aud=agentcore</text>
+
+  <!-- Slack Poster -->
+  <rect x="235" y="520" width="160" height="42" rx="7" fill="#dbeafe" stroke="#0052CC" stroke-width="1.2"></rect>
+  <text class="node-label" x="315" y="539" fill="#1d4ed8">Slack Poster</text>
+  <text class="node-sublabel" x="315" y="552">chat.postMessage</text>
+
+  <!-- IGW CUSTOM_JWT -->
+  <rect x="480" y="115" width="130" height="42" rx="7" fill="#fff3e0" stroke="#c77600" stroke-width="1.2"></rect>
+  <text class="node-label" x="545" y="134" fill="#c77600">CUSTOM_JWT</text>
+  <text class="node-sublabel" x="545" y="147">Validates inbound JWT</text>
+
+  <!-- IGW Router - Path A -->
+  <rect x="480" y="195" width="130" height="36" rx="7" fill="#fff3e0" stroke="#c77600" stroke-width="1.2"></rect>
+  <text class="node-label" x="545" y="214" fill="#c77600" font-size="9.5">Route → Runtime</text>
+  <text class="node-sublabel" x="545" y="225" font-size="7.5">JWT_PASSTHROUGH</text>
+
+  <!-- IGW Router - Path B -->
+  <rect x="480" y="350" width="130" height="36" rx="7" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.2"></rect>
+  <text class="node-label" x="545" y="369" fill="#7c3aed" font-size="9.5">Route → Harness</text>
+  <text class="node-sublabel" x="545" y="380" font-size="7.5">Target selection</text>
+
+  <!-- agent.py -->
+  <rect x="670" y="100" width="170" height="42" rx="7" fill="#dcfce7" stroke="#16a34a" stroke-width="1.2"></rect>
+  <text class="node-label" x="755" y="119" fill="#166534">agent.py (Strands)</text>
+  <text class="node-sublabel" x="755" y="132">Claude on Bedrock</text>
+
+  <!-- identity_claims.py -->
+  <rect x="670" y="165" width="170" height="42" rx="7" fill="#dcfce7" stroke="#16a34a" stroke-width="1.2"></rect>
+  <text class="node-label" x="755" y="184" fill="#166534">identity_claims.py</text>
+  <text class="node-sublabel" x="755" y="197">Re-verify + verified_email()</text>
+
+  <!-- gdrive_tool -->
+  <rect x="670" y="230" width="80" height="36" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1"></rect>
+  <text class="node-label" x="710" y="248" fill="#166534" font-size="8.5">gdrive_tool</text>
+  <text class="node-sublabel" x="710" y="258" font-size="7">M2 delegation</text>
+
+  <!-- github_tool (via gateway) -->
+  <rect x="775" y="230" width="65" height="36" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1"></rect>
+  <text class="node-label" x="808" y="248" fill="#166534" font-size="8.5">github</text>
+  <text class="node-sublabel" x="808" y="258" font-size="7">via TGW</text>
+
+  <!-- Harness internals -->
+  <rect x="670" y="360" width="170" height="36" rx="6" fill="#f3e8ff" stroke="#7c3aed" stroke-width="1"></rect>
+  <text class="node-label" x="755" y="377" fill="#6d28d9" font-size="9">AWS-managed loop</text>
+  <text class="node-sublabel" x="755" y="389">Tools via Gateway (M1 only)</text>
+
+  <!-- Tools GW nodes -->
+  <rect x="905" y="110" width="145" height="36" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1"></rect>
+  <text class="node-label" x="977" y="127" fill="#92400e" font-size="9">GitHub Target</text>
+  <text class="node-sublabel" x="977" y="139">AUTHORIZATION_CODE</text>
+
+  <rect x="905" y="170" width="145" height="36" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1"></rect>
+  <text class="node-label" x="977" y="187" fill="#92400e" font-size="9">Databricks Genie</text>
+  <text class="node-sublabel" x="977" y="199">MCP target (planned)</text>
+
+  <rect x="905" y="230" width="145" height="36" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1"></rect>
+  <text class="node-label" x="977" y="247" fill="#92400e" font-size="9">Confluence</text>
+  <text class="node-sublabel" x="977" y="259">MCP target (planned)</text>
+
+  <rect x="905" y="290" width="145" height="36" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1"></rect>
+  <text class="node-label" x="977" y="307" fill="#92400e" font-size="9">Slack Search</text>
+  <text class="node-sublabel" x="977" y="319">MCP target (planned)</text>
+
+  <!-- External sources -->
+  <rect x="905" y="490" width="68" height="32" rx="5" fill="#dcfce7" stroke="#16a34a" stroke-width="1"></rect>
+  <text class="node-label" x="939" y="508" fill="#166534" font-size="8">G Drive</text>
+
+  <rect x="983" y="490" width="68" height="32" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1"></rect>
+  <text class="node-label" x="1017" y="508" fill="#92400e" font-size="8">GitHub</text>
+
+  <!-- ===== EDGES ===== -->
+
+  <!-- 1: User → Bot -->
+  <line x1="100" y1="97" x2="100" y2="125" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arr-purple)"></line>
+  <circle class="edge-num-bg" cx="100" cy="111" r="7"></circle>
+  <text class="edge-number" x="100" y="114">1</text>
+
+  <!-- 2: Bot → Event Handler -->
+  <line x1="165" y1="146" x2="235" y2="76" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arr-purple)"></line>
+  <circle class="edge-num-bg" cx="200" cy="111" r="7"></circle>
+  <text class="edge-number" x="200" y="114">2</text>
+
+  <!-- 3: Event Handler → Identity Resolver -->
+  <line x1="315" y1="97" x2="315" y2="130" stroke="#0052CC" stroke-width="1.5" marker-end="url(#arr-blue)"></line>
+  <circle class="edge-num-bg" cx="315" cy="113" r="7"></circle>
+  <text class="edge-number" x="315" y="116">3</text>
+
+  <!-- 4: Identity Resolver → JWT Minter -->
+  <line x1="315" y1="172" x2="315" y2="210" stroke="#0052CC" stroke-width="1.5" marker-end="url(#arr-blue)"></line>
+  <circle class="edge-num-bg" cx="315" cy="191" r="7"></circle>
+  <text class="edge-number" x="315" y="194">4</text>
+
+  <!-- 5: JWT Minter → IGW CUSTOM_JWT -->
+  <line x1="395" y1="231" x2="480" y2="136" stroke="#0052CC" stroke-width="2" marker-end="url(#arr-blue)"></line>
+  <circle class="edge-num-bg" cx="437" cy="184" r="7"></circle>
+  <text class="edge-number" x="437" y="187">5</text>
+  <text class="edge-label-text" x="420" y="170" transform="rotate(-40, 420, 170)">Bearer JWT</text>
+
+  <!-- 6: IGW validates → Route -->
+  <line x1="545" y1="157" x2="545" y2="195" stroke="#c77600" stroke-width="1.5" marker-end="url(#arr-orange)"></line>
+  <circle class="edge-num-bg" cx="545" cy="176" r="7"></circle>
+  <text class="edge-number" x="545" y="179">6</text>
+
+  <!-- 7A: IGW Route → Runtime (Path A) -->
+  <line x1="610" y1="213" x2="670" y2="121" stroke="#16a34a" stroke-width="2" marker-end="url(#arr-green)"></line>
+  <circle cx="640" cy="167" r="8" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="640" y="170">7a</text>
+
+  <!-- 7B: IGW Route → Harness (Path B - dashed) -->
+  <path d="M 545 231 L 545 350" fill="none" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-purple)"></path>
+  <circle cx="545" cy="290" r="8" fill="#7c3aed"></circle>
+  <text class="edge-number" x="545" y="293">7b</text>
+
+  <!-- Path B: IGW → Harness -->
+  <line x1="610" y1="368" x2="670" y2="378" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-purple)"></line>
+
+  <!-- 8: Agent → identity_claims -->
+  <line x1="755" y1="142" x2="755" y2="165" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"></line>
+  <circle cx="755" cy="153" r="7" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="755" y="156">8</text>
+
+  <!-- 9: identity_claims → gdrive -->
+  <line x1="710" y1="207" x2="710" y2="230" stroke="#16a34a" stroke-width="1.2" marker-end="url(#arr-green)"></line>
+  <circle cx="710" cy="218" r="7" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="710" y="221">9</text>
+
+  <!-- 10: github_tool → Tools GW -->
+  <line x1="840" y1="248" x2="905" y2="128" stroke="#d97706" stroke-width="1.2" marker-end="url(#arr-amber)"></line>
+  <circle cx="872" cy="188" r="7" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="872" y="191">10</text>
+
+  <!-- 11: Harness → Tools GW -->
+  <line x1="840" y1="378" x2="905" y2="128" stroke="#7c3aed" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arr-amber)"></line>
+  <circle cx="870" cy="260" r="8" fill="#7c3aed"></circle>
+  <text class="edge-number" x="870" y="263">11</text>
+
+  <!-- 12: gdrive_tool → Google Drive (direct) -->
+  <path d="M 710 266 C 710 400, 850 500, 905 506" fill="none" stroke="#16a34a" stroke-width="1.2" marker-end="url(#arr-green)"></path>
+  <circle cx="780" cy="420" r="7" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="780" y="423">12</text>
+  <text class="edge-label-text" x="730" y="380" font-size="7.5" fill="#16a34a">assertion w/ sub=email</text>
+
+  <!-- 13: TGW → GitHub -->
+  <path d="M 1017 326 L 1017 490" fill="none" stroke="#d97706" stroke-width="1.2" marker-end="url(#arr-amber)"></path>
+  <circle cx="1017" cy="420" r="7" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="1017" y="423">13</text>
+  <text class="edge-label-text" x="1025" y="400" font-size="7.5" fill="#d97706">user's OAuth token</text>
+
+  <!-- 14: Response back → Slack Poster -->
+  <path d="M 670 145 C 500 145, 450 400, 395 540" fill="none" stroke="#0052CC" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-blue)"></path>
+  <circle cx="530" cy="350" r="8" fill="#1d4ed8"></circle>
+  <text class="edge-number" x="530" y="353">14</text>
+
+  <!-- 15: Slack Poster → Bot -->
+  <path d="M 235 541 C 150 541, 100 300, 100 167" fill="none" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-purple)"></path>
+  <circle cx="140" cy="380" r="8" fill="#7c3aed"></circle>
+  <text class="edge-number" x="140" y="383">15</text>
+</svg>
+</div>
+
+<p class="section-title">Numbered Data Flow</p>
+<div class="legend">
+  <div class="legend-item"><span class="legend-num">1</span><span class="legend-text"><strong>User asks question in Slack</strong> — already authenticated via Okta SSO to workspace. No login prompt.</span></div>
+  <div class="legend-item"><span class="legend-num">2</span><span class="legend-text"><strong>Slack delivers event payload</strong> — HTTP POST with <code>user_id</code>, <code>team_id</code>, message. Signed by Slack.</span></div>
+  <div class="legend-item"><span class="legend-num">3</span><span class="legend-text"><strong>Verify Slack request signature</strong> — HMAC-SHA256 against Slack signing secret. Confirms authenticity.</span></div>
+  <div class="legend-item"><span class="legend-num">4</span><span class="legend-text"><strong>Resolve identity + mint JWT</strong> — maps <code>user_id → email</code>, signs JWT with <code>sub=user@ripple.com</code>, <code>aud=agentcore</code>.</span></div>
+  <div class="legend-item"><span class="legend-num">5</span><span class="legend-text"><strong>POST to Ingress Gateway</strong> — <code>Authorization: Bearer &lt;jwt&gt;</code>. Same shape as <code>client/ask.py</code> today.</span></div>
+  <div class="legend-item"><span class="legend-num">6</span><span class="legend-text"><strong>Ingress GW validates JWT</strong> — CUSTOM_JWT authorizer checks signature via JWKS, verifies <code>iss</code> + <code>aud</code>.</span></div>
+  <div class="legend-item"><span class="legend-num" style="background:#1d4ed8">7a</span><span class="legend-text"><strong>Path A → Runtime</strong> — JWT_PASSTHROUGH forwards the original JWT unchanged. Runtime's own authorizer validates again. <em>Your primary path — supports both M1+M2.</em></span></div>
+  <div class="legend-item"><span class="legend-num alt">7b</span><span class="legend-text"><strong>Path B → Harness</strong> (exploratory) — routes to managed harness target. <em>⚠️ No <code>RequestHeaderConfiguration</code> — caller JWT not visible to tools. M2 delegation impossible.</em></span></div>
+  <div class="legend-item"><span class="legend-num">8</span><span class="legend-text"><strong>agent.py → identity_claims.py</strong> — re-verifies JWT signature, checks <code>email_verified</code>, domain allowlist. Three fail-closed gates.</span></div>
+  <div class="legend-item"><span class="legend-num">9</span><span class="legend-text"><strong>Dispatch gdrive_tool (M2)</strong> — uses <code>verified_email()</code> as assertion subject. Google mints token scoped to ONE user. <em>Only on Path A.</em></span></div>
+  <div class="legend-item"><span class="legend-num">10</span><span class="legend-text"><strong>github_tool → Tools Gateway</strong> — agent calls through MCP gateway. Gateway holds the user's vaulted OAuth token (M1 consent).</span></div>
+  <div class="legend-item"><span class="legend-num alt">11</span><span class="legend-text"><strong>Harness → Tools Gateway</strong> — managed loop calls tools via gateway with OAUTH (client_credentials). <em>GitHub works; Drive doesn't (shared identity, not per-user).</em></span></div>
+  <div class="legend-item"><span class="legend-num">12</span><span class="legend-text"><strong>Google Drive API</strong> — direct call with domain-wide delegation assertion. Drive trims results to that user's files. <em>Path A only.</em></span></div>
+  <div class="legend-item"><span class="legend-num">13</span><span class="legend-text"><strong>GitHub API</strong> — Tools GW resolves per-user vaulted token, calls GitHub. GitHub returns only repos/files that user can access.</span></div>
+  <div class="legend-item"><span class="legend-num">14</span><span class="legend-text"><strong>Response returns</strong> — answer + citations + confidence band flows back through Ingress GW to Ripple middleware.</span></div>
+  <div class="legend-item"><span class="legend-num alt">15</span><span class="legend-text"><strong>Post to Slack</strong> — <code>chat.postMessage</code> sends formatted answer back to the user's DM or thread.</span></div>
+</div>
+
+<div class="note-box">
+  <strong>Key architectural insight — why both paths exist:</strong><br><br>
+  <span class="path-badge path-a">Path A (Runtime)</span> is the <strong>primary path</strong> and MUST stay. It's the only path where <code>identity_claims.py</code> can read the JWT from the request header and use <code>verified_email()</code> for Google Drive domain-wide delegation (M2). The Ingress Gateway's <code>JWT_PASSTHROUGH</code> is what makes this possible — it forwards the JWT unchanged so <code>agent.py</code> can re-verify it.<br><br>
+  <span class="path-badge path-b">Path B (Harness)</span> is <strong>additive / exploratory</strong>. The managed harness has no <code>RequestHeaderConfiguration</code>, so it cannot see the caller's JWT. It can only reach sources through the Tools Gateway using machine-identity OAuth (client_credentials). This means:
+  <ul style="margin:8px 0 0 16px;padding:0;">
+    <li><strong>✅ GitHub works</strong> — Tools GW handles per-user token vault + consent (M1)</li>
+    <li><strong>❌ Google Drive does NOT work</strong> — needs per-user email for assertion subject; harness can't provide it</li>
+    <li><strong>⚠️ Shared identity risk</strong> — without per-user JWT pass-through, all harness calls appear as one machine identity</li>
+  </ul>
+  <br>
+  <strong>What changes from adding Slack:</strong> Only the caller identity — from Auth0 (device-code flow) to your Slack middleware. The Ingress Gateway's CUSTOM_JWT authorizer trusts both issuers, so CLI and Slack coexist. Everything inside the AgentCore boundary (steps 6–14) is unchanged.
+</div>
+
+<p class="section-title">Slack References</p>
+<div class="legend" style="grid-template-columns: 1fr;">
+  <div class="legend-item" style="flex-direction:column; gap:6px;">
+    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+      <thead>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <th style="text-align:left; padding:6px 8px; font-weight:600; color:var(--color-text);">Topic</th>
+          <th style="text-align:left; padding:6px 8px; font-weight:600; color:var(--color-text);">URL</th>
+          <th style="text-align:left; padding:6px 8px; font-weight:600; color:var(--color-text);">Relevant to step</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Sign in with Slack (OIDC)</td>
+          <td style="padding:6px 8px;"><a href="https://docs.slack.dev/authentication/sign-in-with-slack/" style="color:var(--color-primary);">docs.slack.dev/authentication/sign-in-with-slack</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Background — Slack's JWT (<code>id_token</code>) issuance via OpenID Connect</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Slack OIDC Discovery</td>
+          <td style="padding:6px 8px;"><a href="https://slack.com/.well-known/openid-configuration" style="color:var(--color-primary);">slack.com/.well-known/openid-configuration</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">JWKS URI, issuer, token endpoint — useful if passing Slack's own <code>id_token</code></td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Verifying requests from Slack</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/authentication/verifying-requests-from-slack" style="color:var(--color-primary);">api.slack.com/authentication/verifying-requests-from-slack</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Step 3 — HMAC-SHA256 signature verification of incoming payloads</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Events API</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/apis/events-api" style="color:var(--color-primary);">api.slack.com/apis/events-api</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Step 2 — how Slack delivers event payloads (user messages, mentions)</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">users.info method</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/methods/users.info" style="color:var(--color-primary);">api.slack.com/methods/users.info</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Step 4 — resolve <code>user_id</code> to <code>profile.email</code></td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">chat.postMessage method</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/methods/chat.postMessage" style="color:var(--color-primary);">api.slack.com/methods/chat.postMessage</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Step 15 — post agent response back to user's Slack thread/DM</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Bot vs User tokens</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/authentication/token-types" style="color:var(--color-primary);">api.slack.com/authentication/token-types</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Bot token (<code>xoxb-</code>) for posting; user token not needed for this flow</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--color-border-light);">
+          <td style="padding:6px 8px;">Slack App Manifest</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/reference/manifests" style="color:var(--color-primary);">api.slack.com/reference/manifests</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">App config — event subscriptions, OAuth scopes, bot user setup</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 8px;">Socket Mode (alternative)</td>
+          <td style="padding:6px 8px;"><a href="https://api.slack.com/apis/socket-mode" style="color:var(--color-primary);">api.slack.com/apis/socket-mode</a></td>
+          <td style="padding:6px 8px; color:var(--color-text-muted);">Alternative to Events API — WebSocket instead of HTTP POST (no public URL needed)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+
+
+</body></html>
